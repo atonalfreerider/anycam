@@ -7,11 +7,9 @@ import cv2
 sys.path.append(".")
 sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
 
-import sys
 import os
 import numpy as np
 import torch
-import torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
 import hydra
@@ -26,14 +24,12 @@ from anycam.common.geometry import get_grid_xy
 from anycam.utils.geometry import se3_ensure_numerical_accuracy
 from anycam.visualization.common import color_tensor
 
-
-
-
 def load_video(video_path):
     video = VideoFileClip(video_path)
     frames = [frame for frame in video.iter_frames()]
     frames = [frame.astype(np.float32) / 255.0 for frame in frames]
     fps = video.fps
+
     return frames, fps
 
 
@@ -223,7 +219,20 @@ def plot_to_rerun(
         h, w = img.shape[:2]
         device = depth.device
 
-        proj = torch.tensor(proj, device=device).float()
+        # Resize depth to match image dimensions if needed
+        if depth.shape[-2:] != (h, w):
+            depth = torch.nn.functional.interpolate(
+                depth.unsqueeze(0) if depth.dim() == 2 else depth.unsqueeze(0),
+                size=(h, w),
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0)
+
+        # Convert projection matrix to tensor if it's a numpy array
+        if isinstance(proj, np.ndarray):
+            proj = torch.from_numpy(proj).to(device).float()
+        else:
+            proj = proj.clone().detach().to(device).float()
 
         proj[0, 0] = proj[0, 0] / w * 2
         proj[1, 1] = proj[1, 1] / h * 2
@@ -239,7 +248,7 @@ def plot_to_rerun(
         pts = pose.to(pts.dtype) @ pts
         pts = pts[:3, :].T
 
-        colors = torch.tensor(img.reshape(-1, 3)).to(device)
+        colors = torch.from_numpy(img.reshape(-1, 3)).to(device)
 
         return pts, colors
     
@@ -271,14 +280,18 @@ def plot_to_rerun(
     for id in range(len(trajectory)):
         rr.set_time_sequence("step", id)
 
-
         pose = trajectory[id]
         rot = pose[:3, :3].cpu().numpy()
 
+        # Convert projection matrix for rerun logging
+        if isinstance(proj, np.ndarray):
+            proj_focal = float(proj[0, 0])
+        else:
+            proj_focal = float(proj[0, 0])
 
         rr.log(f"world/scene/active_cam", rr.Pinhole(
             resolution=[w, h],
-            focal_length=float(proj[0, 0]),
+            focal_length=proj_focal,
             image_plane_distance=image_plane_distance, 
         ), static=True)
         rr.log(f"world/scene/active_cam", rr.Transform3D(translation=pose[:3, 3].cpu(), mat3x3=rot, axis_length=0.01))
@@ -293,13 +306,24 @@ def plot_to_rerun(
 
             kid = keyframes.index(id)
 
-            pts, colors = lift_image(torch.tensor(imgs[id]).cuda(), depths[kid].cuda(), trajectory[id].cuda(), proj)
-            mask = filter_depth(depths[kid].cuda(), threshold=filter_depth_threshold)
+            # Get the depth for this keyframe and resize if needed
+            depth = depths[kid].cuda()
+            if depth.shape[-2:] != (h, w):
+                depth = torch.nn.functional.interpolate(
+                    depth.unsqueeze(0) if depth.dim() == 2 else depth.unsqueeze(0),
+                    size=(h, w),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0)
+
+            pts, colors = lift_image(imgs[id], depth, trajectory[id].cuda(), proj)
+            # Compute mask on the resized depth
+            mask = filter_depth(depth, threshold=filter_depth_threshold)
 
             mask = mask.view(-1)
 
             if max_depth > 0:
-                mask = mask & depths[kid].view(-1)
+                mask = mask & (depth.view(-1) < max_depth)
 
             pts = pts[mask, :]
             colors = colors[mask, :]
@@ -459,10 +483,14 @@ def main(cfg: DictConfig):
         np.save(output_path / "trajectory.npy", trajectory_np)
         
         # Save projection matrix
-        np.save(output_path / "projection.npy", proj.cpu().numpy())
+        if isinstance(proj, torch.Tensor):
+            proj_np = proj.cpu().numpy()
+        else:
+            proj_np = proj
+        np.save(output_path / "projection.npy", proj_np)
         
         # Save depths if available
-        if depths:
+        if depths is not None and len(depths) > 0:
             depths_np = np.stack([depth.cpu().numpy() for depth in depths])
             np.save(output_path / "depths.npy", depths_np)
         
