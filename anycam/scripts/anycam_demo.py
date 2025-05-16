@@ -1,6 +1,5 @@
 import sys
 import os
-import uuid
 
 import cv2
 
@@ -11,18 +10,19 @@ import os
 import numpy as np
 import torch
 from pathlib import Path
-from tqdm import tqdm
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from moviepy import VideoFileClip
-import rerun as rr
+from dotdict import dotdict
 
 
 from anycam.loss import make_loss
 from anycam.trainer import AnyCamWrapper
-from anycam.common.geometry import get_grid_xy
 from anycam.utils.geometry import se3_ensure_numerical_accuracy
-from anycam.visualization.common import color_tensor
+from anycam.scripts.fit_video import fit_video
+from anycam.scripts.plot import plot_to_rerun
+from anycam.models.depth_predictor_wrapper import NPZDepthWrapper
+
 
 def load_video(video_path):
     video = VideoFileClip(video_path)
@@ -31,43 +31,6 @@ def load_video(video_path):
     fps = video.fps
 
     return frames, fps
-
-
-def subsample_frames(frames, original_fps=None, target_fps=0):
-    """
-    Subsample frames to achieve target framerate
-    
-    Args:
-        frames: List of frames
-        original_fps: Original framerate of the video (if known)
-        target_fps: Target framerate (0 or None means use all frames)
-        
-    Returns:
-        List of subsampled frames
-    """
-    if not frames or target_fps <= 0 or not original_fps:
-        return frames
-        
-    # Calculate the stride to achieve target fps
-    stride = max(1, round(original_fps / target_fps))
-    
-    return frames[::stride]
-
-
-def load_frames(image_path):
-    frames = []
-
-    for filename in tqdm(list(sorted(os.listdir(image_path)))):
-        if filename.endswith(('.png', '.jpg', '.jpeg')):
-            file_path = os.path.join(image_path, filename)
-            frame = cv2.imread(file_path)
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            frame = frame.astype(np.float32) / 255.0
-
-            frames.append(frame)
-
-    return frames, None
 
 
 def format_frames(frames, target_size=336):
@@ -85,12 +48,13 @@ def format_frames(frames, target_size=336):
     return frames
 
 
-def load_anycam(model_path, checkpoint=None):
+def load_anycam(model_path, depth_dir, checkpoint=None):
     config = OmegaConf.load(model_path / "training_config.yaml")
 
     prefix = "training_checkpoint_"
     ckpts = Path(model_path).glob(f"{prefix}*.pt")
 
+    config["model"]["depth_predictor"]["depth_dir"] = depth_dir
     model_conf = config["model"]
     model_conf["use_provided_flow"] = False
     model_conf["train_directions"] = "forward"
@@ -118,7 +82,7 @@ def load_anycam(model_path, checkpoint=None):
     return model, criterion
 
 
-def process_video(model, criterion, frames, config=None, ba_refinement=True):
+def process_video(model, criterion, frames, config=None, ba_refinement=True, depth_dir=None):
     """
     Process a video by fitting the AnyCam model to the provided frames.
     
@@ -129,6 +93,7 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
         config: Optional configuration dictionary for the fit_video function
                If None, default configuration will be used
         ba_refinement: Whether to perform bundle adjustment refinement (default: True)
+        depth_dir: Optional path to directory containing pre-computed NPZ depth files
     
     Returns:
         trajectory: The estimated camera trajectory
@@ -136,18 +101,19 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
         extras_dict: Additional information from the fitting process
         ba_extras: Bundle adjustment extra information
     """
-    from dotdict import dotdict
-    from anycam.scripts.fit_video import fit_video
-    
-    # Default configuration if none provided
+
+    if depth_dir is None:
+        raise ValueError("no depth dir")
+
+    # Default configuration with memory optimizations
     if config is None:
         default_config = {
             "with_rerun": False,
             "do_ba_refinement": ba_refinement,
             "prediction": {
-                "model_seq_len": 100,
-                "shift": 99,
-                "square_crop": True,
+                "model_seq_len": 32,  # Reduced from 100 to 32 for memory
+                "shift": 31,  # Reduced accordingly
+                "square_crop": False,
                 "return_all_uncerts": False,
             },
             "ba_refinement": {
@@ -155,11 +121,11 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
                 "max_uncert": 0.05,
                 "lambda_smoothness": 0.1,
                 "long_tracks": True,
-                "n_steps_last_global": 5000,
+                "n_steps_last_global": 2000, # Reduced from 5000
             },
-            "ba_refinement_level": 2,
+            "ba_refinement_level": 1,  # Increased from 0 to reduce frames processed
             "dataset": {
-                "image_size": [336, None]
+                "image_size": [224, None]  # Reduced from 336 to 224 for memory
             }
         }
         config = dotdict(default_config)
@@ -169,9 +135,35 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
     # Ensure the BA refinement setting is applied to the config
     config.do_ba_refinement = ba_refinement
 
+    # Replace depth predictor with NPZ loader if depth_dir is provided
+    # Create NPZ depth wrapper with proper frame alignment
+    npz_depth_predictor = NPZDepthWrapper({
+        "depth_dir": depth_dir,
+        "scaling": 1.0,
+        "frame_pattern": "depth_{:06d}.npz",
+        "depth_key": "depth"
+    }).cuda()
+
+    # Replace the depth predictor in the model
+    model._depth_predictor = npz_depth_predictor
+
+    # Reset frame index to ensure alignment with video frames
+    npz_depth_predictor.reset_frame_index()
+
+    # Verify frame count alignment
+    print(f"Video frames: {len(frames)}, Available depth frames: {len(npz_depth_predictor.available_frames)}")
+    if len(frames) > len(npz_depth_predictor.available_frames):
+        raise Exception(f"Video has more frames ({len(frames)}) than depth maps ({len(npz_depth_predictor.available_frames)})")
+
     print(f"Processing {len(frames)} frames...")
     print(f"Bundle adjustment refinement: {'Enabled' if ba_refinement else 'Disabled'}")
     
+    # Clear GPU memory before processing
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        initial_memory = torch.cuda.memory_allocated() / 1024**3
+        print(f"Initial GPU memory usage: {initial_memory:.2f} GB")
+
     # Run fit_video function
     trajectory, proj, extras_dict, ba_extras = fit_video(
         config,
@@ -185,164 +177,6 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
     return trajectory, proj, extras_dict, ba_extras
 
 
-def plot_to_rerun(
-        trajectory, 
-        depths, 
-        imgs, 
-        proj,
-        uncertainties=None, 
-        subsample_pts=1, 
-        radii=1.5, 
-        uncertainty_thresh=-1, 
-        max_depth=-1, 
-        filter_depth_threshold=0.1,
-        image_plane_distance=0.05,
-        keyframes=None,
-        rerun_mode="spawn",
-        ):
-    
-    h, w = imgs[0].shape[:2]
-
-    def filter_depth(depth, threshold=0.1):
-        _, h, w = depth.shape
-
-        depth = depth.clone()[None, ...]
-        median = torch.median(depth)
-        
-        depth_grad = torch.stack(torch.gradient(depth, dim=(-2, -1))).norm(dim=0)
-
-        mask = depth_grad < median * threshold
-
-        return mask
-    
-    def lift_image(img, depth, pose, proj):
-        h, w = img.shape[:2]
-        device = depth.device
-
-        # Resize depth to match image dimensions if needed
-        if depth.shape[-2:] != (h, w):
-            depth = torch.nn.functional.interpolate(
-                depth.unsqueeze(0) if depth.dim() == 2 else depth.unsqueeze(0),
-                size=(h, w),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(0)
-
-        # Convert projection matrix to tensor if it's a numpy array
-        if isinstance(proj, np.ndarray):
-            proj = torch.from_numpy(proj).to(device).float()
-        else:
-            proj = proj.clone().detach().to(device).float()
-
-        proj[0, 0] = proj[0, 0] / w * 2
-        proj[1, 1] = proj[1, 1] / h * 2
-        proj[0, 2] = proj[0, 2] / w * 2 - 1
-        proj[1, 2] = proj[1, 2] / h * 2 - 1
-
-        inv_proj = torch.inverse(proj)
-
-        pts = get_grid_xy(h, w, homogeneous=True).reshape(3, h*w).to(device)
-        pts = inv_proj @ pts
-        pts = pts * depth.view(1, -1).to(device)
-        pts = torch.cat((pts, torch.ones(1, h*w, device=device)), dim=0)
-        pts = pose.to(pts.dtype) @ pts
-        pts = pts[:3, :].T
-
-        colors = torch.from_numpy(img.reshape(-1, 3)).to(device)
-
-        return pts, colors
-    
-    imgs = np.array(imgs)
-
-    # Initialize rerun with appropriate mode
-    if rerun_mode == "spawn":
-        rr.init("AnyCam Demo", recording_id=uuid.uuid4(), spawn=True)
-    elif rerun_mode == "connect":
-        rr.init("AnyCam Demo", recording_id=uuid.uuid4(), spawn=False)
-        print(f"Connecting to existing Rerun server.")
-        rr.connect()
-    else:
-        raise ValueError(f"Unsupported rerun mode: {rerun_mode}. Use 'spawn' or 'connect'.")
-    
-    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
-    rr.log("world/scene", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
-    blueprint = rr.blueprint.Blueprint(
-        rr.blueprint.Horizontal(
-            rr.blueprint.Spatial3DView(origin="/world/scene"),
-            rr.blueprint.Vertical(
-                rr.blueprint.Spatial2DView(origin="/world/scene/active_cam/input"),
-                rr.blueprint.Spatial2DView(origin="/world/scene/active_cam/uncertainty"),
-            ),
-        ),
-    )
-    rr.send_blueprint(blueprint, make_active=True)
-
-    for id in range(len(trajectory)):
-        rr.set_time_sequence("step", id)
-
-        pose = trajectory[id]
-        rot = pose[:3, :3].cpu().numpy()
-
-        # Convert projection matrix for rerun logging
-        if isinstance(proj, np.ndarray):
-            proj_focal = float(proj[0, 0])
-        else:
-            proj_focal = float(proj[0, 0])
-
-        rr.log(f"world/scene/active_cam", rr.Pinhole(
-            resolution=[w, h],
-            focal_length=proj_focal,
-            image_plane_distance=image_plane_distance, 
-        ), static=True)
-        rr.log(f"world/scene/active_cam", rr.Transform3D(translation=pose[:3, 3].cpu(), mat3x3=rot, axis_length=0.01))
-
-        rr.log("world/scene/cam_traj", rr.LineStrips3D([pose[:3, 3].cpu().numpy().tolist() for pose in trajectory[:id+1]], colors=[(0, 255, 0)]), static=False)
-
-        rr.log("world/scene/active_cam/input", rr.Image((imgs[id] * 255).astype(np.uint8)).compress(jpeg_quality=95))
-        
-        rr.log("world/scene", rr.Transform3D(translation=pose[:3, 3].cpu(), mat3x3=rot, axis_length=0, from_parent=True))
-
-        if keyframes is None or id in keyframes:
-
-            kid = keyframes.index(id)
-
-            # Get the depth for this keyframe and resize if needed
-            depth = depths[kid].cuda()
-            if depth.shape[-2:] != (h, w):
-                depth = torch.nn.functional.interpolate(
-                    depth.unsqueeze(0) if depth.dim() == 2 else depth.unsqueeze(0),
-                    size=(h, w),
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(0)
-
-            pts, colors = lift_image(imgs[id], depth, trajectory[id].cuda(), proj)
-            # Compute mask on the resized depth
-            mask = filter_depth(depth, threshold=filter_depth_threshold)
-
-            mask = mask.view(-1)
-
-            if max_depth > 0:
-                mask = mask & (depth.view(-1) < max_depth)
-
-            pts = pts[mask, :]
-            colors = colors[mask, :]
-
-            pts = pts[subsample_pts//2::subsample_pts]
-            colors = colors[subsample_pts//2::subsample_pts]
-            colors = (colors * 255).clamp(0, 255).to(torch.uint8)
-
-            rr.log(f"world/scene/active_points", rr.Points3D(pts[:, :3].cpu().numpy(), colors=colors[:, :3].cpu().numpy(), radii=rr.Radius.ui_points([radii]),))
-
-            if uncertainties is not None:
-                uncertainty_img = color_tensor((uncertainties[kid] / uncertainty_thresh).clamp(0, 1), cmap="plasma", norm=False)[0]
-                uncertainty_img = uncertainty_img.cpu().numpy()
-                uncertainty_img = (uncertainty_img * 255).astype(np.uint8)
-
-                rr.log(f"world/scene/active_cam/uncertainty", rr.Image(uncertainty_img).compress(jpeg_quality=95))
-
-
-
 @hydra.main(version_base=None, config_name=None)
 def main(cfg: DictConfig):
     """
@@ -351,6 +185,7 @@ def main(cfg: DictConfig):
     Example usage:
     - Process video: python anycam_demo.py input_path=/path/to/video output_path=/path/to/output
     - Process images: python anycam_demo.py input_path=/path/to/images_folder output_path=/path/to/output
+    - Use pre-computed depths: python anycam_demo.py input_path=/path/to/video depth_dir=/path/to/npz_depths
     - Visualize with rerun: python anycam_demo.py input_path=/path/to/video visualize=true
     - Connect to existing rerun server: python anycam_demo.py input_path=/path/to/video visualize=true rerun_mode=connect rerun_address=localhost:8787
     - Export to COLMAP: python anycam_demo.py input_path=/path/to/video export_colmap=true output_path=/path/to/colmap_output
@@ -362,6 +197,7 @@ def main(cfg: DictConfig):
     - output_path: Path to save outputs
     - model_path: Path to model (optional)
     - checkpoint: Specific checkpoint to use (optional)
+    - depth_dir: Path to directory containing pre-computed NPZ depth files (optional)
     - visualize: Whether to visualize results with rerun (boolean)
     - rerun_mode: Mode to use for rerun visualization ('spawn' or 'connect', default: 'spawn')
     - rerun_address: Address to connect to when using rerun_mode=connect (default: localhost:8787)
@@ -381,12 +217,12 @@ def main(cfg: DictConfig):
     output_path = cfg.get("output_path", None)
     model_path = cfg.get("model_path", None)
     checkpoint = cfg.get("checkpoint", None)
+    depth_dir = cfg.get("depth_dir", None)  # New parameter for NPZ depths
     visualize = cfg.get("visualize", False)
     rerun_mode = cfg.get("rerun_mode", "spawn")
     export_colmap = cfg.get("export_colmap", False)
     image_size = cfg.get("image_size", 336)
     ba_refinement = cfg.get("ba_refinement", True)
-    target_fps = cfg.get("fps", 0)  # 0 means use all frames
     
     if input_path is None:
         print("Error: input_path is required")
@@ -398,79 +234,110 @@ def main(cfg: DictConfig):
     else:
         model_path = Path(model_path)
     
+    # Validate depth_dir if provided
+    if depth_dir and not os.path.exists(depth_dir):
+        print(f"Error: depth_dir does not exist: {depth_dir}")
+        return
+    
     # Load input data
-    if os.path.isdir(input_path):
-        print(f"Loading frames from directory: {input_path}")
-        frames, _ = load_frames(input_path)
-    else:
-        print(f"Loading video from: {input_path}")
-        frames, fps = load_video(input_path)
+    print(f"Loading video from: {input_path}")
+    frames, fps = load_video(input_path)
     
     if not frames:
         print("Error: No frames loaded")
         return
         
     print(f"Loaded {len(frames)} frames")
-    
-    # Subsample frames if target_fps is specified
-    if target_fps > 0 and fps:
-        frames = subsample_frames(frames, original_fps=fps, target_fps=target_fps)
-        print(f"Subsampled frames to {len(frames)} frames at {target_fps} fps")
-    
-    # Format frames for processing
+
+    # Format frames for processing with memory consideration
     frames = format_frames(frames, target_size=image_size)
+
     print(f"Resized frames to {frames[0].shape[:2]}")
     
     # Load model
     print(f"Loading model from {model_path}")
-    model, criterion = load_anycam(model_path, checkpoint)
+    model, criterion = load_anycam(model_path, depth_dir, checkpoint)
     model = model.cuda().eval()
     
-    # Process frames
-    trajectory, proj, extras_dict, ba_extras = process_video(
-        model, 
-        criterion, 
-        frames, 
-        ba_refinement=ba_refinement
-    )
+    # Process frames with memory monitoring
+    try:
+        trajectory, proj, extras_dict, ba_extras = process_video(
+            model, 
+            criterion, 
+            frames, 
+            ba_refinement=ba_refinement,
+            depth_dir=depth_dir
+        )
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"CUDA out of memory error: {e}")
+        print("Try reducing image_size, max_frames, or model_seq_len parameters")
+        torch.cuda.empty_cache()
+        return
 
-    trajectory = [se3_ensure_numerical_accuracy(torch.tensor(pose)) for pose in trajectory]
+    trajectory = [se3_ensure_numerical_accuracy(pose.clone().detach()) for pose in trajectory]
     
     # Extract depth and uncertainty information
     best_candidate = extras_dict["best_candidate"]
     depths = extras_dict["seq_depths"]
 
     if not ba_refinement:
-        read_frames = frames
-        frames = extras_dict["images"].permute(0, 2, 3, 1).cpu().numpy()
-        keyframes = [i for i in range(len(trajectory))]
+        processed_frames = extras_dict["images"].permute(0, 2, 3, 1).cpu().numpy()
         uncertainties = torch.stack(extras_dict["uncertainties"])[:, 0, best_candidate, :1, :, :]
+        
+        # For non-BA case, use processed frames for visualization
+        vis_frames = processed_frames
     else:
-        keyframes = [i * 3 for i in range(len(trajectory) // 3)]
+        # For BA case, fix the depth-to-trajectory mapping
+        ba_refinement_level = extras_dict.get("ba_refinement_level", 1)
+        
+        print(f"BA refinement debug:")
+        print(f"  ba_refinement_level from extras: {ba_refinement_level}")
+        print(f"  Total trajectory poses: {len(trajectory)}")
+        print(f"  Total depth maps: {len(depths)}")
+        
+        # Calculate the correct ratio
+        poses_per_depth = len(trajectory) / len(depths) if len(depths) > 0 else 1
+        print(f"  Calculated poses per depth: {poses_per_depth}")
+        
         uncertainties = extras_dict["ba_uncertainties"]
-        read_frames = frames
+        
+        # For BA case, use original frames for visualization
+        vis_frames = frames
 
+    # Print debugging information
+    print(f"Frame mapping debug:")
+    print(f"  Total trajectory poses: {len(trajectory)}")
+    print(f"  Total depth maps: {len(depths)}")
+    print(f"  Total images: {len(vis_frames)}")
+    print(f"  BA refinement level: {ba_refinement_level if ba_refinement else 'N/A'}")
 
-    uncertainties = torch.cat((uncertainties, uncertainties[-1:]), dim=0)
-    
+    # Extend uncertainties to match trajectory length if needed
+    if uncertainties is not None and len(uncertainties) < len(trajectory):
+        # For BA case, repeat uncertainties according to actual refinement level
+        if ba_refinement:
+            extended_uncertainties = []
+            actual_refinement_level = len(trajectory) // len(uncertainties) if len(uncertainties) > 0 else 1
+            
+            for i, uncert in enumerate(uncertainties):
+                # Each uncertainty applies to actual_refinement_level trajectory poses
+                for _ in range(actual_refinement_level):
+                    if len(extended_uncertainties) < len(trajectory):
+                        extended_uncertainties.append(uncert)
+            
+            # Handle any remaining poses
+            while len(extended_uncertainties) < len(trajectory):
+                extended_uncertainties.append(uncertainties[-1])
+                
+            uncertainties = torch.stack(extended_uncertainties[:len(trajectory)])
+        else:
+            # For non-BA case, just repeat the last uncertainty
+            last_uncert = uncertainties[-1:] if len(uncertainties) > 0 else torch.zeros_like(uncertainties[:1]) if len(uncertainties) > 0 else None
+            if last_uncert is not None:
+                while len(uncertainties) < len(trajectory):
+                    uncertainties = torch.cat((uncertainties, last_uncert), dim=0)
     
     print(f"Processed video: {len(trajectory)} poses, {len(depths)} depth maps")
-    
-    if export_colmap:
-        if output_path is None:
-            print("Warning: output_path not specified, using temporary directory")
-        
-        from anycam.utils.colmap_io import export_to_colmap
-        
-        print("Exporting results to COLMAP format...")
-        colmap_path = export_to_colmap(
-            trajectory=trajectory,
-            proj=proj,
-            imgs=read_frames,
-            out_dir=output_path
-        )
-        print(f"Exported COLMAP reconstruction to {colmap_path}")
-    
+
     # Save trajectory and projection matrix if output_path is specified
     if output_path and not export_colmap:
         output_path = Path(output_path)
@@ -510,7 +377,7 @@ def main(cfg: DictConfig):
         plot_to_rerun(
             trajectory=trajectory,
             depths=depths,
-            imgs=frames,
+            imgs=vis_frames,  # Use appropriate frames for visualization
             proj=proj,
             uncertainties=uncertainties,
             subsample_pts=vis_config.get("subsample_pts", 2),
@@ -519,7 +386,6 @@ def main(cfg: DictConfig):
             max_depth=vis_config.get("max_depth", -1),
             filter_depth_threshold=vis_config.get("filter_depth_threshold", 0.1),
             image_plane_distance=vis_config.get("image_plane_distance", 0.05),
-            keyframes=keyframes,
             rerun_mode=rerun_mode,
         )
         

@@ -81,7 +81,7 @@ loss:
 
 model:
   depth_predictor:
-    type: "unidepth"
+    type: "NPZ"
     
   pose_predictor:
     type: "anycam"

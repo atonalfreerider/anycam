@@ -1,31 +1,19 @@
-import argparse
-from copy import deepcopy
-import copy
 import logging
 from pathlib import Path
 import uuid
 
 import cv2
 import hydra
-from hydra import initialize, compose
-import matplotlib
-from matplotlib import pyplot as plt
-import numpy as np
 from omegaconf import DictConfig
 import omegaconf
-import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
-import torch.nn.functional as F
-from torchvision.utils import flow_to_image
 
 import sys
-
 
 sys.path.append("../..")
 sys.path.append(".")
 
-from anycam.visualization.common import color_tensor
 from anycam.loss import make_loss
 from anycam.scripts.common import get_checkpoint_path, load_model
 from anycam.trainer import induce_flow_dist, make_proj_from_focal_length
@@ -33,11 +21,11 @@ from anycam.utils.geometry import average_pose
 from anycam.utils.bundle_adjustment import *
 from anycam.loss.metric import rotation_angle
 
+
 try:
     import rerun as rr
 except:
     rr = None
-
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +150,7 @@ def fit_video_wrapper(config, model, criterion, imgs, device, gt_proj=None):
 
 
 @torch.no_grad()
-def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None):
-
+def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None, start_frame_idx=0, frame_step=1):
     seq_imgs = []
     seq_depths = []
     seq_flow_occs_fwd = []
@@ -176,14 +163,26 @@ def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None):
         assert imgs0 is not None
         assert imgs1 is not None
 
-    for (i, (img0, img1)) in tqdm(list(enumerate(zip(imgs0, imgs1)))):
-        img_pair = torch.stack([img0, img1]).unsqueeze(0).cuda()
+    # Always use NPZ depth predictor
+    depth_predictor = model.depth_predictor if hasattr(model, 'depth_predictor') else model.model.depth_predictor
 
+    for (i, (img0, img1)) in tqdm(list(enumerate(zip(imgs0, imgs1)))):
+        frame_idx_0 = start_frame_idx + i * frame_step
+        frame_idx_1 = start_frame_idx + (i + 1) * frame_step
+        
+        img_pair = torch.stack([img0, img1]).unsqueeze(0).cuda()
         images_ip_fwd, images_ip_bwd = model.image_processor(img_pair * 2 - 1, data={})
 
-        depth = model.depth_predictor(img0.unsqueeze(0).cuda())
+        del img_pair
+        torch.cuda.empty_cache()
 
-        depth = 1 / depth[0].clamp_min(1e-3)
+        # Always use NPZ depth predictor
+        depth = depth_predictor(
+            img0.unsqueeze(0).cuda(), 
+            frame_indices=[frame_idx_0]
+        )[0]
+        depth = depth.squeeze(0)
+        depth_clone = depth.clone()
 
         seq_imgs.append(img0.cpu())
 
@@ -194,19 +193,51 @@ def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None):
             seq_flow_occs_fwd.append(images_ip_fwd[0, :1, 3:6].cpu())
             seq_flow_occs_bwd.append(images_ip_bwd[0, 1:, 3:6].cpu())
 
-        seq_depths.append(depth.cpu())
+        seq_depths.append(depth_clone.cpu())
+        
+        del images_ip_fwd, images_ip_bwd, depth, depth_clone
+        torch.cuda.empty_cache()
 
     if imgs is not None:
-        depth = model.depth_predictor(img1.unsqueeze(0).cuda())
-        depth = 1 / depth[0].clamp_min(1e-3)
+        last_frame_idx = start_frame_idx + len(imgs0) * frame_step
+        print(f"compute_depth_flow: Processing last frame, frame index: {last_frame_idx}")
+        
+        depth = depth_predictor(
+            img1.unsqueeze(0).cuda(), 
+            frame_indices=[last_frame_idx]
+        )[0]
+        depth = depth.squeeze(0)
+        depth_clone = depth.clone()
 
         seq_imgs.append(img1.cpu())
-        seq_depths.append(depth.cpu())
+        seq_depths.append(depth_clone.cpu())
+        
+        del depth, depth_clone
+        torch.cuda.empty_cache()
 
+    # Stack tensors and verify depth-frame alignment
     seq_imgs = torch.stack(seq_imgs, dim=0)
-    seq_depths = torch.cat(seq_depths, dim=0)
+    seq_depths_stacked = []
+    for i, depth in enumerate(seq_depths):
+        actual_frame_idx = start_frame_idx + i
+        
+        if depth.dim() == 3 and depth.shape[0] == 1:
+            seq_depths_stacked.append(depth)
+        elif depth.dim() == 2:
+            seq_depths_stacked.append(depth.unsqueeze(0))
+        else:
+            seq_depths_stacked.append(depth)
+    
+    seq_depths = torch.stack(seq_depths_stacked, dim=0)
     seq_flow_occs_fwd = torch.cat(seq_flow_occs_fwd, dim=0)
     seq_flow_occs_bwd = torch.cat(seq_flow_occs_bwd, dim=0)
+
+    print(f"compute_depth_flow: Final sequences - imgs: {seq_imgs.shape}, depths: {seq_depths.shape}")
+    print(f"compute_depth_flow: Frame-to-depth verification:")
+    for i in range(min(5, seq_depths.shape[0])):
+        actual_frame_idx = start_frame_idx + i
+        frame_depth = seq_depths[i]
+        print(f"  Seq index {i} = Frame {actual_frame_idx}: depth mean {frame_depth.mean():.6f}")
 
     return seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd
 
@@ -225,8 +256,12 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
 
     prediction_config = config.get("prediction", {})
 
-    model_seq_len = prediction_config.get("model_seq_len", 64)
-    shift = prediction_config.get("shift", 63)
+    # Reduce sequence length to save memory
+    model_seq_len = min(prediction_config.get("model_seq_len", 64), 32)  # Reduced from 100 to 32
+    shift = min(prediction_config.get("shift", 63), 31)  # Reduced accordingly
+    
+    print(f"MEMORY OPTIMIZATION: Reduced model_seq_len to {model_seq_len}, shift to {shift}")
+
     square_crop = prediction_config.get("square_crop", False)
     return_all_uncerts = prediction_config.get("return_all_uncerts", False)
 
@@ -243,10 +278,9 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
     print(f"proj_strategy: {proj_strategy}")
     print(f"proj_label_source: {proj_label_source}")
 
-
     dataset = make_dataset(dataset_config, imgs, device="cpu")
 
-    if config.with_rerun:
+    if config.get("with_rerun", False):
         rr.init("Prediction", recording_id=uuid.uuid4())
         rr.connect()
 
@@ -255,16 +289,7 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
             rr.log(f"world/img", rr.Image((img.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)).compress(jpeg_quality=95))
 
     # Preprocess all images
-
     logger.info("Preprocessing images")
-
-    dont_compute = False
-
-    if model.pose_predictor.backbone_type == "croco":
-        logger.info("Ignore flow and depth for CroCo")
-        dont_compute = True
-
-
 
     c, h, w = dataset.imgs.shape[1:]
 
@@ -279,26 +304,49 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
     if square_crop:
         seq_imgs = seq_imgs[:, :, (h-sq)//2:(h-sq)//2+sq, (w-sq)//2:(w-sq)//2+sq]
 
-    seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(model, seq_imgs)
+    seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(model, seq_imgs, start_frame_idx=0)
     
     def prepare_batch(batch_ids_ids):
         batch_size, frame_count = batch_ids_ids.shape
-
         batch_ids_ids = batch_ids_ids.cpu()
 
+        # Reduce frame count if memory issues
+        if frame_count > 32:
+            print(f"MEMORY: Reducing frame count from {frame_count} to 32")
+            frame_count = 32
+            batch_ids_ids = batch_ids_ids[:, :frame_count]
+
         imgs = seq_imgs[batch_ids_ids.view(-1), :, :, :].reshape(batch_size, frame_count, c, h_, w_)
-        depths = seq_depths[batch_ids_ids.view(-1)].reshape(batch_size, frame_count, 1, h_, w_)
+        
+        depth_indices = batch_ids_ids.view(-1)
+        indexed_depths = []
+        for i, idx in enumerate(depth_indices):
+            depth = seq_depths[idx]
+            indexed_depths.append(depth)
+        
+        selected_depths = torch.stack(indexed_depths, dim=0)
+        
+        if selected_depths.dim() == 4:
+            depths = selected_depths.reshape(batch_size, frame_count, selected_depths.shape[1], h_, w_)
+        elif selected_depths.dim() == 3:
+            depths = selected_depths.reshape(batch_size, frame_count, 1, h_, w_)
+        else:
+            raise ValueError(f"Unexpected depth tensor dimensions: {selected_depths.shape}")
+        
         flow_occ_fwd = seq_flow_occs_fwd[batch_ids_ids.view(-1)].reshape(batch_size, frame_count, 3, h_, w_)
         flow_occ_bwd = seq_flow_occs_bwd[batch_ids_ids.view(-1)].reshape(batch_size, frame_count, 3, h_, w_)
 
-        # Concatenate forward and backward
-        imgs = torch.cat([imgs, imgs.flip(1)], dim=0).cuda()
-        depths = torch.cat([depths, depths.flip(1)], dim=0).cuda()
-        flow_occs = torch.cat([flow_occ_fwd, flow_occ_bwd.flip(1)], dim=0).cuda()
+        # Move to GPU one at a time to conserve memory
+        imgs = torch.cat([imgs, imgs.flip(1)], dim=0)
+        depths = torch.cat([depths, depths.flip(1)], dim=0)
+        flow_occs = torch.cat([flow_occ_fwd, flow_occ_bwd.flip(1)], dim=0)
+        
+        # Move to GPU
+        imgs = imgs.cuda()
+        depths = depths.cuda()
+        flow_occs = flow_occs.cuda()
 
         return imgs, depths, flow_occs
-    
-    # device = "cuda"
     
     candidate_trajectories = [torch.eye(4, device=device).view(1, 4, 4).expand(model.pose_predictor.focal_num_candidates, -1, -1)]
     sub_trajectories = []
@@ -311,7 +359,10 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
     pose_predictor = model.pose_predictor
     pose_predictor.eval()
 
-    for i in tqdm(range(0, len(dataset)-1, shift)):
+    for i in tqdm(range(0, len(dataset)-1, shift), desc="Preparing batches"):  # SINGLE tqdm bar for batch preparation
+        # Clear GPU cache before each iteration
+        torch.cuda.empty_cache()
+        
         batch_ids = torch.arange(i, i+1, device=device).view(-1, 1)
         seq_len_ = min(model_seq_len, len(dataset)-i)
         ids = torch.arange(0, seq_len_, device=device).view(1, -1)
@@ -322,11 +373,58 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
         flow_occs[:, -1, :2] = 0
         flow_occs[:, -1, 2] = 1
 
-        pose_result = pose_predictor(
-            images=imgs,
-            depths=depths,
-            flow_occs=flow_occs,
-        )
+        # Debug: Check memory usage
+        if torch.cuda.is_available():
+            memory_used = torch.cuda.memory_allocated() / 1024**3  # GB
+            memory_cached = torch.cuda.memory_reserved() / 1024**3  # GB
+            tqdm.write(f"GPU Memory: {memory_used:.2f}GB used, {memory_cached:.2f}GB cached")  # Use tqdm.write to avoid bar duplication
+
+
+        # Check if we're using NPZ depth predictor
+        using_npz_depth = False
+        if hasattr(model, 'pose_predictor') and hasattr(model.pose_predictor, 'backbone_type'):
+            if model.pose_predictor.backbone_type == "croco":
+                # For CroCo, we can call the pose predictor directly
+                pose_result = model.pose_predictor(
+                    images=imgs,
+                    depths=depths,
+                    flow_occs=flow_occs,
+                )
+            else:
+                # For DepthAnything-based models, check if we have NPZ depth
+                depth_predictor = None
+                if hasattr(model, 'model') and hasattr(model.model, 'depth_predictor'):
+                    depth_predictor = model.model.depth_predictor
+                elif hasattr(model, 'depth_predictor'):
+                    depth_predictor = model.depth_predictor
+                elif hasattr(model, '_depth_predictor'):
+                    depth_predictor = model._depth_predictor
+                
+                if depth_predictor is not None and hasattr(depth_predictor, 'depth_dir'):
+                    using_npz_depth = True
+                
+                if using_npz_depth:
+                    # For NPZ depth case, we still need to process images but can skip some backbone processing
+                    # Don't skip image features entirely - let the model handle it with proper dtype
+                    pose_result = model.pose_predictor(
+                        images=imgs,
+                        depths=depths,
+                        flow_occs=flow_occs,
+                    )
+                else:
+                    # Normal case - let the model handle everything
+                    pose_result = model.pose_predictor(
+                        images=imgs,
+                        depths=depths,
+                        flow_occs=flow_occs,
+                    )
+        else:
+            # Fallback for unknown model structure
+            pose_result = model.pose_predictor(
+                images=imgs,
+                depths=depths,
+                flow_occs=flow_occs,
+            )
 
         if proj_label_source == "prediction":
             proj_label = pose_result["focal_length_probs"][:, 0]
@@ -358,7 +456,25 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
         poses = average_pose(torch.stack([fwd_poses, bwd_poses]))
 
         with torch.autocast(device_type="cuda", enabled=False):
-            r_angles = rotation_angle(poses[:, 16, :3, :3].to(torch.float32), torch.eye(3, device=device).view(1, 3, 3).expand(poses.shape[0], -1, -1))
+            # Fix the indexing issue - poses has shape [seq_len, 4, 4], not [batch, seq_len, 4, 4]
+            if poses.dim() == 3:
+                # poses shape: [seq_len, 4, 4]
+                if poses.shape[0] > 0:
+                    # Use the first pose's rotation matrix, or middle pose if available
+                    pose_idx = min(poses.shape[0] // 2, poses.shape[0] - 1) if poses.shape[0] > 1 else 0
+                    r_angles = rotation_angle(
+                        poses[pose_idx:pose_idx+1, :3, :3].to(torch.float32), 
+                        torch.eye(3, device=device).view(1, 3, 3)
+                    )
+                else:
+                    r_angles = torch.tensor([0.0], device=device)
+            else:
+                # Original code for 4D tensors
+                r_angles = rotation_angle(
+                    poses[:, 16, :3, :3].to(torch.float32), 
+                    torch.eye(3, device=device).view(1, 3, 3).expand(poses.shape[0], -1, -1)
+                )
+            
             mean_angle = torch.mean(r_angles).item()
             mean_angle = 1
             angle_sum = angle_sum + mean_angle
@@ -378,7 +494,27 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
 
             last_pose = candidate_trajectories[-1]
 
-            sub_trajectory = [last_pose @ pose for pose in sub_trajectory]
+            # Fix tensor dimension mismatch - ensure consistent number of candidates
+            sub_trajectory_fixed = []
+            for pose in sub_trajectory:
+                # Ensure pose has the same number of candidates as last_pose
+                if pose.shape[0] != last_pose.shape[0]:
+                    if pose.shape[0] == 1:
+                        # Expand pose to match last_pose candidates
+                        pose = pose.expand(last_pose.shape[0], -1, -1)
+                    elif last_pose.shape[0] == 1:
+                        # Take only the first candidate from pose
+                        pose = pose[:1]
+                    else:
+                        # Take minimum number of candidates
+                        min_candidates = min(pose.shape[0], last_pose.shape[0])
+                        pose = pose[:min_candidates]
+                        if sub_trajectory_fixed == []:  # First iteration, also fix last_pose
+                            last_pose = last_pose[:min_candidates]
+                
+                sub_trajectory_fixed.append(last_pose @ pose)
+
+            sub_trajectory = sub_trajectory_fixed
 
             for k, pose in enumerate(poses):
                 if k+1 < len(extra_poses):
@@ -391,7 +527,7 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
 
         sub_trajectories.append(sub_trajectory)
 
-        if config.with_rerun:
+        if config.get("with_rerun", False):
 
             cmap = plt.get_cmap('hsv')
             cmap_cycle = 16
@@ -487,13 +623,16 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
                 else:
                     uncert_level = ba_refinement_level
 
-
                 imgs0 = dataset.imgs[:-1:uncert_level]
                 imgs1 = dataset.imgs[1::uncert_level]
 
                 n_new = len(imgs0)
 
-                seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(model, imgs0=imgs0, imgs1=imgs1)
+                # IMPORTANT: Pass the correct start_frame_idx for BA refinement
+                # BA refinement processes every ba_refinement_level frames, so start from 0 with proper spacing
+                seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(
+                    model, imgs0=imgs0, imgs1=imgs1, start_frame_idx=0
+                )
 
                 seq_imgs = torch.cat([seq_imgs, seq_imgs[-1:]], dim=0)
                 seq_depths = torch.cat([seq_depths, seq_depths[-1:]], dim=0)
@@ -537,29 +676,31 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
                 print("Recomputing uncertainties done.", len(ba_uncertainties))
 
                 seq_imgs = dataset.imgs[::ba_refinement_level][:len(ba_uncertainties)]
-                # print(len(seq_imgs), len(dataset.imgs[::ba_refinement_level]))
             else:
                 seq_imgs = dataset.imgs[::ba_refinement_level]
                 ba_uncertainties = uncertainties[::ba_refinement_level]
 
-
             c, h, w = dataset.imgs.shape[1:]
 
-            seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(model, seq_imgs)
+            # CRITICAL FIX: Pass the correct frame step for BA refinement
+            # Since seq_imgs contains every ba_refinement_level-th frame, we need to load depths
+            # with the same spacing from the NPZ files
+            print(f"BA refinement: Loading depths with frame step={ba_refinement_level}")
+            
+            seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(
+                model, seq_imgs, start_frame_idx=0, frame_step=ba_refinement_level
+            )
 
         else:
             seq_imgs = dataset.imgs
 
-
         ba_uncertainties = torch.stack(ba_uncertainties)
         ba_uncertainties = ba_uncertainties[:, 0, best_candidate, :1]
-
 
         best_trajectory, proj, ba_extras = ba_refinement(
             ba_refinement_config, 
             best_trajectory[::ba_refinement_level][:len(seq_imgs)], 
             proj, 
-            # uncertainties[:len(ba_imgs)-1], 
             ba_uncertainties,
             seq_imgs, 
             seq_depths, 
@@ -574,7 +715,7 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
 
         for i in range(len(dataset.imgs)):
             if i % ba_refinement_level == 0 and (i // ba_refinement_level )< l:
-                interpolated_poses.append(torch.tensor(best_trajectory[i // ba_refinement_level]))
+                interpolated_poses.append(best_trajectory[i // ba_refinement_level].clone().detach())
             else:
                 if i // ba_refinement_level + 1 < l:
                     prev_pose = best_trajectory[i // ba_refinement_level]
@@ -583,7 +724,7 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
 
                     t = (i % ba_refinement_level) / ba_refinement_level
 
-                    interpolated_pose = average_pose(torch.stack([torch.tensor(prev_pose), torch.tensor(next_pose)]), weight=t)
+                    interpolated_pose = average_pose(torch.stack([prev_pose.clone().detach(), next_pose.clone().detach()]), weight=t)
 
                     interpolated_poses.append(interpolated_pose)
                 else:
@@ -594,7 +735,7 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
 
                     next = last0 @ rel
 
-                    interpolated_poses.append(torch.tensor(next))
+                    interpolated_poses.append(next.clone().detach())
 
         interpolated_poses = torch.stack(interpolated_poses).cpu()
 
@@ -621,9 +762,10 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
             "ba_uncertainties": ba_uncertainties,
             "best_candidate": best_candidate,
             "focal_length_candidates": pose_result["focal_length_candidates"],
+            "ba_refinement_level": ba_refinement_level - 1,  # Store the actual level used (subtract 1 since we added 1 earlier)
+            "actual_depth_to_pose_ratio": len(best_trajectory) / len(seq_depths) if len(seq_depths) > 0 else 1.0,
         }
         return best_trajectory, proj, extras_dict, ba_extras
-
 
 
 @torch.compile(mode="reduce-overhead", fullgraph=True)
@@ -837,6 +979,25 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
     print("Starting BA refinement.")
     print("Note: Due to torch.compile, the first iteration might be slow, but the overall speed will be significantly improved after that.")
 
+    # Move tqdm to wrap the entire BA optimization process, not per window/global
+    total_ba_steps = 0
+    # Estimate total steps for the BA progress bar
+    seq_len_ba = seq_flow_occs_fwd.shape[0]
+    ba_window = config.get("ba_window", 8)
+    overlap = config.get("overlap", 6)
+    n_steps_sliding = config.get("n_steps_sliding", 400)
+    n_steps_global = config.get("n_steps_global", 100)
+    n_steps_last_global = config.get("n_steps_last_global", 5000)
+    global_every_n = config.get("global_every_n", 2)
+
+    # Estimate number of sliding and global steps
+    n_sliding = max(1, (seq_len_ba - 1) // (ba_window - overlap) + 1)
+    n_global = n_sliding // global_every_n + 2  # +2 for last global
+    total_ba_steps = n_sliding * n_steps_sliding + (n_global - 1) * n_steps_global + n_steps_last_global
+
+    # Use leave=False to prevent tqdm from printing a new bar on close, and dynamic_ncols for better IDE support
+    ba_pbar = tqdm(total=total_ba_steps, desc="Bundle Adjustment", leave=False, dynamic_ncols=True)
+
     while optimized_until < seq_len or not last_global_done:
         do_last_global = optimized_until >= seq_len
 
@@ -850,17 +1011,16 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
 
         seq_ids = torch.arange(seq_len, device=device)
 
+        # Use ba_pbar.write instead of tqdm.write or print to avoid bar duplication in PyCharm/IDE
         if not do_global:
-            print(f"Optimizing from {ba_window_start} to {ba_window_end}")
-
+            ba_pbar.write(f"Optimizing from {ba_window_start} to {ba_window_end}")
 
             ba_param_inv_depth_mask = (ba_indices[:, :, :, 0, 0] >= optimized_until) & (ba_indices[:, :, :, 0, 0] < ba_window_end)
             ba_param_pose_mask = ((seq_ids >= optimized_until) & (seq_ids < ba_window_end)).view(1, -1, 1)
             loss_mask = (ba_indices[:, :, :, 1:, 0] >= ba_window_start) & (ba_indices[:, :, :, 1:, 0] < ba_window_end)
 
         else:
-
-            print(f"Optimizing globally util {optimized_until}")
+            ba_pbar.write(f"Optimizing globally util {optimized_until}")
 
             ba_param_inv_depth_mask = (ba_indices[:, :, :, 0, 0] >= 0) & (ba_indices[:, :, :, 0, 0] < optimized_until)
             ba_param_pose_mask = ((seq_ids >= 0) & (seq_ids < optimized_until)).view(1, -1, 1)
@@ -869,7 +1029,6 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
         if all_reg_to_zero and do_last_global:
             lambda_depth = 0
             lambda_pose = 0
-
 
         ba_poses = param_to_pose(ba_param_rot, ba_param_t).detach().clone()
 
@@ -913,9 +1072,7 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
             else:
                 n_steps_ = n_steps_global
 
-        pbar = tqdm(range(n_steps_))
-
-        for step in pbar:
+        for step in range(n_steps_):
             optimizer.zero_grad()
 
             # Detach relevant parameters:
@@ -924,11 +1081,9 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
 
             ba_param_rot_d = ba_param_rot.clone()            
             ba_param_rot_d[~ba_param_pose_mask.expand_as(ba_param_rot_d)] = ba_param_rot_d[~ba_param_pose_mask.expand_as(ba_param_rot_d)].detach()
-            # ba_param_rot_d[~ba_param_pose_mask.expand_as(ba_param_rot_d)].detach_()
 
             ba_param_t_d = ba_param_t.clone()
             ba_param_t_d[~ba_param_pose_mask.expand_as(ba_param_t_d)] = ba_param_t_d[~ba_param_pose_mask.expand_as(ba_param_t_d)].detach()
-            # ba_param_t_d[~ba_param_pose_mask.expand_as(ba_param_t_d)].detach_()
 
             repr_loss, smoothness_loss, ba_proj, xyzh_world = compute_loss(ba_param_inv_depth_d, ba_param_rot_d, ba_param_t_d, ba_param_focal_length, pixel_tracks, ba_indices, ba_uncerts, w, h, loss_mask, max_uncert)
 
@@ -952,38 +1107,21 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
 
             torch.nn.utils.clip_grad_norm_([ba_param_inv_depth, ba_param_rot, ba_param_t, ba_param_focal_length], .1)
 
-
             optimizer.step()
 
-            # pbar.set_postfix({"total_loss": total_loss.item(), "loss": loss.item(), "pose_loss": pose_loss.item(), "depth_loss": depth_loss.item(), "depth_repr_loss": depth_loss_repr.mean().item(),"smoothness_loss": smoothness_loss.item(), "fx": ba_proj[0, 0, 0].item(), "fy": ba_proj[0, 1, 1].item(), "uncert_mean": pt_mean.item(), "uncert_std": pt_std.item()})
-            pbar.set_postfix({"l": total_loss.item(), "l_s": smoothness_loss.item(), "fx": ba_proj[0, 0, 0].item(), "fy": ba_proj[0, 1, 1].item()})
+            ba_pbar.update(1)
 
-            log_step += 1
-
-            if log_step % log_interval == 0 and with_rerun:
-                ba_poses_c2w = param_to_pose(ba_param_rot, ba_param_t)
-
-                if optimize_relatives:
-                    ba_poses_c2w_ = [ba_poses[:, 0]]
-                    for i in range(1, seq_len):
-                        ba_poses_c2w_.append(torch.inverse(ba_poses_c2w[:, i-1]) @ ba_poses_c2w_[-1])
-
-                    ba_poses_c2w = torch.stack(ba_poses_c2w_, dim=1)
-
-                log_ba_imgs(ba_imgs, timestep=seq_len + rerun_offset * 2 + (log_step // log_interval), frame_idx=ba_window_end-1)
-                
-                log_ba_state(
-                    ba_poses_c2w,
-                    points=xyzh_world[:, ::1, :3, 0].permute(0, 2, 1),
-                    point_colors=rgbs[:, :, :, :1, :].reshape(1, -1, 3)[:, ::1],
-                    timestep=seq_len + rerun_offset * 2  + (log_step // log_interval),
-                    max_dist=10,
+            if step == 0 or (step + 1) % 50 == 0:
+                ba_pbar.write(
+                    f"BA Step {ba_pbar.n}/{total_ba_steps} | l: {total_loss.item():.4f} | l_s: {smoothness_loss.item():.4f} | fx: {ba_proj[0, 0, 0].item():.2f} | fy: {ba_proj[0, 1, 1].item():.2f}"
                 )
 
         if not do_global:
             optimized_until = ba_window_end
 
         global_ba_step += 1
+
+    ba_pbar.close()
 
     ba_poses_c2w = param_to_pose(ba_param_rot, ba_param_t)
 
@@ -1044,7 +1182,7 @@ def main(config: DictConfig):
 
     logger.info("Creating dataset")
 
-    dataset = make_dataset(imgs, device=device)
+    dataset = make_dataset(config.get("dataset", {}), imgs, device=device)
 
     if rr is None:
         logger.warning("Rerun is not installed, will not record")
@@ -1055,11 +1193,6 @@ def main(config: DictConfig):
         rr.connect()
 
         rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
-
-
-    # logger.info("Overfitting model")
-
-    # overfit_model(config, model, criterion, dataset)
 
     logger.info("Fitting video")
 

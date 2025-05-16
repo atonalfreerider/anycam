@@ -3,6 +3,7 @@ import math
 import os
 import torch
 import requests
+import numpy as np
 
 import sys
 
@@ -226,9 +227,136 @@ def unimatch_fwd(model, img0, img1):
     return flow_fwd, flow_bwd
 
 
+def get_outpath_videodepthanything(out_folder, img_path, frame_idx):
+    """Generate output path for VideoDepthAnything NPZ files"""
+    return os.path.join(out_folder, "videodepthanything_depths", f"depth_{frame_idx:06d}.npz")
+
+
+def save_depth_npz(out_path, depth_array):
+    """Save depth array as NPZ file"""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    np.savez_compressed(out_path, depth=depth_array)
+
+
+def get_videodepthanything_model():
+    """Load VideoDepthAnything model"""
+    try:
+        # Import VideoDepthAnything - adjust import path as needed
+        from video_depth_anything import VideoDepthAnything
+        
+        model = VideoDepthAnything(encoder='vitl')
+        # Load pretrained weights here if needed
+        # model.load_state_dict(torch.load(checkpoint_path))
+        model.eval()
+        for param in model.parameters():
+            param.requires_grad = False
+        return model
+    except ImportError:
+        raise ImportError("VideoDepthAnything not found. Please install or add to path.")
+
+
+@torch.no_grad()
+def preprocess_videodepthanything_depths(args):
+    """Preprocess depths using VideoDepthAnything"""
+    dataset_name = args.dataset
+    split = args.split
+    data_path = args.data_path
+    out_path = args.out_path
+    
+    # Get dataset
+    if dataset_name == "sintel":
+        dataset = get_sintel_dataset(data_path, split, 1)
+    elif dataset_name == "waymo":
+        dataset = get_waymo_dataset(data_path, split, 1)
+    elif dataset_name == "realestate10k":
+        dataset = get_realestate10k_dataset(data_path, split, 1)
+    elif dataset_name == "youtubevos":
+        dataset = get_youtubevos_dataset(data_path, split, 1)
+    elif dataset_name == "opendv":
+        dataset = get_opendv_dataset(data_path, split, 1)
+    elif dataset_name == "walkingtours":
+        dataset = get_walkingtours_dataset(data_path, split, 1)
+    else:
+        raise ValueError("Unknown dataset")
+    
+    model = get_videodepthanything_model().cuda()
+    
+    # Process sequences
+    sequences = {}
+    for i in tqdm(range(len(dataset))):
+        seq, _ = dataset._index_to_seq_ids(i)
+        if seq not in sequences:
+            sequences[seq] = []
+        
+        data = dataset[i]
+        paths = dataset.get_img_paths(i)
+        sequences[seq].append({
+            'data': data,
+            'paths': paths,
+            'index': i
+        })
+    
+    # Process each sequence with VideoDepthAnything
+    for seq_name, seq_data in sequences.items():
+        print(f"Processing sequence: {seq_name}")
+        
+        # Collect all frames for this sequence
+        frames = []
+        frame_info = []
+        
+        for item in seq_data:
+            for j, img in enumerate(item['data']['imgs']):
+                frames.append(img)
+                frame_info.append({
+                    'path': item['paths'][j],
+                    'seq': seq_name,
+                    'frame_idx': len(frames) - 1
+                })
+        
+        # Process frames in batches using VideoDepthAnything
+        batch_size = 32  # VideoDepthAnything processes 32 frames at once
+        
+        for start_idx in range(0, len(frames), batch_size):
+            end_idx = min(start_idx + batch_size, len(frames))
+            batch_frames = frames[start_idx:end_idx]
+            
+            # Pad batch if needed
+            while len(batch_frames) < batch_size and len(batch_frames) > 0:
+                batch_frames.append(batch_frames[-1])
+            
+            if len(batch_frames) == 0:
+                continue
+                
+            # Convert to tensor batch
+            batch_tensor = torch.stack([torch.tensor(f) for f in batch_frames]).cuda()
+            batch_tensor = batch_tensor.unsqueeze(0)  # Add batch dimension
+            
+            # Run VideoDepthAnything
+            with torch.no_grad():
+                depths = model(batch_tensor)  # Shape: [1, T, H, W]
+                depths = depths.squeeze(0)   # Shape: [T, H, W]
+            
+            # Save individual depth maps
+            actual_frames = min(end_idx - start_idx, len(depths))
+            for i in range(actual_frames):
+                frame_idx = start_idx + i
+                if frame_idx < len(frame_info):
+                    info = frame_info[frame_idx]
+                    depth_array = depths[i].cpu().numpy()
+                    
+                    out_path_depth = get_outpath_videodepthanything(
+                        out_path, info['path'], info['frame_idx']
+                    )
+                    save_depth_npz(out_path_depth, depth_array)
+
+
 @torch.no_grad()
 def main(args):
     # Your code logic goes here
+    
+    if hasattr(args, 'preprocess_depths') and args.preprocess_depths:
+        preprocess_videodepthanything_depths(args)
+        return
     
     dataset = args.dataset
     split = args.split

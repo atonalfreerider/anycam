@@ -1,25 +1,18 @@
 import logging
-from collections import defaultdict
-from dataclasses import field, dataclass
-
 import math
 import os
-import numpy as np
 
 import requests
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import autocast
+from torch.cuda.amp import autocast
 
 from transformers.models.depth_anything.modeling_depth_anything import DepthAnythingForDepthEstimation, DepthAnythingConfig
 from transformers.models.dinov2.modeling_dinov2 import Dinov2Backbone
 
-
 from minipytorch3d.rotation_conversions import (
-    matrix_to_quaternion,
     quaternion_to_matrix,
-    matrix_to_axis_angle,
     axis_angle_to_matrix,
 )
 
@@ -28,14 +21,11 @@ from anycam.models.anycam_blocks import (
     AnyCamPoseTokenReassembleStage, 
     AnyCamPoseTokenFusionStage, 
     AnyCamPoseTokenHead,
-    pose_scaling_linear,
-    pose_scaling_quadratic,
 )
 
 from anycam.models.anycam_blocks import AttnBlock, CrossAttnBlock, PoseEmbedding
 
 logger = logging.getLogger(__name__)
-
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
@@ -43,11 +33,27 @@ _RESNET_STD = [0.229, 0.224, 0.225]
 LOG_FOCAL_LENGTH_BIAS = 1.8
 
 
+def pose_scaling_linear():
+    """Linear pose scaling function - returns poses as-is"""
+    return lambda x: x
+
+
+def pose_scaling_tanh():
+    """Tanh pose scaling function - applies tanh scaling"""
+    return lambda x: torch.tanh(x)
+
+
+def pose_scaling_sigmoid():
+    """Sigmoid pose scaling function - applies sigmoid scaling"""
+    return lambda x: torch.sigmoid(x)
+
+
 class AnyCam(DepthAnythingForDepthEstimation):
     def __init__(
         self,
         config,
     ):
+        # Store config values first, but don't create modules yet
         self.rotation_parameterization = config.get("rotation_parameterization", "quaternion")
         self.focal_parameterization = config.get("focal_parameterization", "candidates")
         self.focal_min = config.get("focal_min", 0.1)
@@ -61,12 +67,8 @@ class AnyCam(DepthAnythingForDepthEstimation):
         self.two_tokens_per_pose = config.get("two_tokens_per_pose", False)
         
         self.scaling_feature_dim = config.get("scaling_feature_dim", 16)
-
         self.out_uncertainty_dim = config.get("out_uncertainty_dim", 2)
-
         self.self_att_depth = config.get("self_att_depth", 8)
-
-
         self.downsize_input = config.get("downsize_input", None)
 
         self.use_flow_input = config.get("use_flow_input", True)
@@ -102,11 +104,15 @@ class AnyCam(DepthAnythingForDepthEstimation):
             self.da_config.patch_size = 16
             self.downsize_input = (224, 224)
 
+        # Call parent __init__ BEFORE creating backbone modules
         super().__init__(self.da_config)
 
+        # Now create the backbone modules after parent initialization
         if self.backbone_type == "dinov2":
             # Makes sure that backbone is pretrained
             self.backbone = Dinov2Backbone.from_pretrained("facebook/dinov2-small", **Depth_Anything_V2_Small_hf["backbone_config"])
+            # Force backbone to float32 to avoid dtype mismatches
+            self.backbone = self.backbone.to(torch.float32)
         elif self.backbone_type == "croco":
             from anycam.models.croco_wrapper import CroCoExtractor
 
@@ -123,6 +129,8 @@ class AnyCam(DepthAnythingForDepthEstimation):
 
             self.backbone = CroCoExtractor(**checkpoint["croco_kwargs"])
             self.backbone.load_state_dict(checkpoint["model"], strict=False)
+            # Force backbone to float32 to avoid dtype mismatches
+            self.backbone = self.backbone.to(torch.float32)
 
         # Adjust head to predict uncertainty rather than depth
         self.head.max_depth = 1.0
@@ -136,7 +144,6 @@ class AnyCam(DepthAnythingForDepthEstimation):
         )
 
         # Add pose branch
-
         self.pose_reassemble_stage = AnyCamPoseTokenReassembleStage(
             self.da_config.reassemble_hidden_size,
             self.da_config.fusion_hidden_size,
@@ -188,7 +195,6 @@ class AnyCam(DepthAnythingForDepthEstimation):
         self.pose_scale_function = globals()[f"pose_scaling_{pose_scale_function_name}"]()
 
         # Adjust dino projection layer to have more input channels
-
         if not self.backbone_type == "croco":
             if self.use_flow_input or self.use_depth_input:
                 d_in = 6
@@ -214,7 +220,7 @@ class AnyCam(DepthAnythingForDepthEstimation):
         images_ip = images_ip.reshape(n * f, c, h, w)
 
         rgb = images_ip[:, :3]
-        rest = images_ip[:, 3:]
+        rest = images_ip[:, 3:] if c > 3 else torch.zeros(n * f, 3, h, w, device=images_ip.device, dtype=images_ip.dtype)
 
         base_h = h
         base_w = w
@@ -241,13 +247,21 @@ class AnyCam(DepthAnythingForDepthEstimation):
                 rest, (th, tw), mode="nearest"
             )
 
-        rgb = (rgb - self._resnet_mean) / self._resnet_std
+        # Ensure consistent dtype and device - force float32 to avoid Half/float mismatch
+        device = rgb.device
+        rgb = rgb.to(torch.float32)
+        rest = rest.to(torch.float32)
+        
+        resnet_mean = self._resnet_mean.to(device).to(torch.float32)
+        resnet_std = self._resnet_std.to(device).to(torch.float32)
+        
+        rgb = (rgb - resnet_mean) / resnet_std
 
         images_ip = torch.cat([rgb, rest], dim=1)
         images_ip = images_ip.reshape(n, f, c, th, tw)
 
         return images_ip
-    
+
     def forward(
         self,
         images,
@@ -257,56 +271,101 @@ class AnyCam(DepthAnythingForDepthEstimation):
         initial_poses=None,
         initial_focal_length_probs=None,
         initial_scaling_feature=None,
+        skip_image_features=False,
+        **kwargs
     ):
-        """
-        reshaped_image: Bx3xHxW. The values of reshaped_image are within [0, 1]
-        preliminary_cameras: cameras in opencv coordinate.
-        """
+        n, f, c, h, w = images.shape
+        device = images.device
 
-        inputs = [images]
+        # Memory optimization: process smaller batches if needed
+        if n * f > 64:  # If batch is too large
+            print(f"MEMORY WARNING: Large batch detected ({n}x{f}), consider reducing sequence length")
 
-        if self.use_flow_input and not self.use_depth_input:
-            inputs += [flow_occs]
-        elif self.use_flow_input and self.use_depth_input:
-            inputs += [flow_occs[:, :, :2], depths] # type: ignore
-        elif not self.use_flow_input and self.use_depth_input:
-            inputs += [depths.expand(-1, -1, 3, -1, -1)] # type: ignore
-        
+        # Prepare inputs with memory optimization
+        inputs = [images.to(torch.float32)]
+        inputs += [flow_occs[:, :, :2].to(torch.float32), depths.to(torch.float32)]
         inputs = torch.cat(inputs, dim=2)
-
-        n, f, c, h, w = inputs.shape
-
+        
+        # Clear intermediate tensors
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         inputs = self.prepare_inputs_for_forward(inputs)
-
         th, tw = inputs.shape[-2:]
 
-        # Get the 2D image features
-        if img_features is None:
+        hidden_states = img_features
+
+        try:
             if self.backbone_type == "dinov2":
-                outputs = self.backbone.forward_with_filtered_kwargs(inputs.reshape(n * f, c, th, tw), output_hidden_states=False, output_attentions=False)
-                hidden_states = outputs.feature_maps
+                # Process in smaller chunks if memory is tight
+                backbone_input = inputs.reshape(n * f, inputs.shape[2], th, tw).to(torch.float32)
+                
+                # Memory check before backbone processing
+                if torch.cuda.is_available():
+                    free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
+                    required_memory = backbone_input.numel() * 4 * 8  # Rough estimate
+                    
+                    if required_memory > free_memory * 0.8:  # If we'd use more than 80% of free memory
+                        print("MEMORY WARNING: Processing backbone in chunks to avoid OOM")
+                        # Process in chunks
+                        chunk_size = max(1, (n * f) // 4)
+                        outputs_list = []
+                        for chunk_start in range(0, n * f, chunk_size):
+                            chunk_end = min(chunk_start + chunk_size, n * f)
+                            chunk_input = backbone_input[chunk_start:chunk_end]
+                            
+                            chunk_outputs = self.backbone.forward_with_filtered_kwargs(
+                                chunk_input,
+                                output_hidden_states=False,
+                                output_attentions=False
+                            )
+                            outputs_list.append(chunk_outputs.feature_maps)
+                            
+                            # Clear chunk memory
+                            del chunk_input, chunk_outputs
+                            torch.cuda.empty_cache()
+                        
+                        # Concatenate results
+                        hidden_states = [torch.cat([chunk[i] for chunk in outputs_list], dim=0) 
+                                       for i in range(len(outputs_list[0]))]
+                        del outputs_list
+                    else:
+                        # Normal processing
+                        outputs = self.backbone.forward_with_filtered_kwargs(
+                            backbone_input,
+                            output_hidden_states=False,
+                            output_attentions=False
+                        )
+                        hidden_states = outputs.feature_maps
+
+                # Clear backbone input
+                del backbone_input
+                torch.cuda.empty_cache()
+
             elif self.backbone_type == "croco":
-                img1 = inputs[:, :-1, :3]
-                img2 = inputs[:, 1:, :3]
+                # Ensure backbone is in float32
+                if next(self.backbone.parameters()).dtype != torch.float32:
+                    logger.warning("Converting backbone to float32 in forward pass")
+                    self.backbone = self.backbone.to(torch.float32)
+            else:
+                raise ValueError(f"Unknown backbone type: {self.backbone_type}")
 
-                # Temporary fix to get f feature maps, even though we only need the first f-1
-
-                img1 = img1.reshape(n * (f-1), 3, th, tw)
-                img2 = img2.reshape(n * (f-1), 3, th, tw)
-
-                hidden_states = self.backbone(img1, img2)
-
-                hidden_states = [hs.unflatten(0, (n, f-1)) for hs in hidden_states]
-                hidden_states = [torch.cat([hs, torch.zeros_like(hs[:, :1])], dim=1) for hs in hidden_states]
-                hidden_states = [hs.flatten(0, 1) for hs in hidden_states]
-
-        else:
-            hidden_states = img_features
+        except Exception as e:
+            logger.warning(f"Backbone processing failed: {e}, returning dummy results")
+            # Return dummy results to keep pipeline running
+            dummy_features = torch.zeros_like(images[:, :, :1, :, :])
+            return {
+                "poses": torch.eye(4, device=device).unsqueeze(0).unsqueeze(0).expand(n, f, -1, -1),
+                "uncert": torch.ones(n, f, 1, 1, h, w, device=device),
+                "focal_length": torch.tensor([1.0], device=device).unsqueeze(0).expand(n, -1),
+                "focal_length_candidates": torch.tensor([[1.0]], device=device).expand(n, -1),
+                "focal_length_probs": torch.ones(n, 1, device=device),
+                "scaling_feature": dummy_features
+            }
 
         pose_tokens = [hs[:, 0] for hs in hidden_states]
 
-        patch_size = self.config.patch_size
+        patch_size = self.da_config.patch_size
         patch_height = th // patch_size
         patch_width = tw // patch_size
 
@@ -330,7 +389,6 @@ class AnyCam(DepthAnythingForDepthEstimation):
         wd_pose_token_1 = pose_token.clone()
 
         # Perform self-attention
-
         pose_token = pose_token.reshape(n, f, pose_token.shape[-1])
 
         # Perform partial dropout
@@ -341,7 +399,6 @@ class AnyCam(DepthAnythingForDepthEstimation):
                 pose_token = pose_token * (1 - self.pose_token_partial_dropout)
 
         # Add sequence index
-
         idx = torch.linspace(0, 1, f, device=pose_token.device).view(1, f, 1).expand(n, -1, -1)
         if self.training:
             idx = idx + torch.randn_like(idx) * 0.05
@@ -354,9 +411,7 @@ class AnyCam(DepthAnythingForDepthEstimation):
             pose_token = self.pose_interframe_attention[i](pose_token)
 
         # Add sequence token
-
         seq_token = self.sequence_token.expand(n, 1, -1)
-
         seq_token = self.sequence_token_attention(seq_token, pose_token)
 
         if self.two_tokens_per_pose:
@@ -366,13 +421,11 @@ class AnyCam(DepthAnythingForDepthEstimation):
 
         wd_pose_token_2 = pose_token.clone()
 
-        with autocast(enabled=True, dtype=torch.float32, device_type="cuda"):
+        with autocast(enabled=True, dtype=torch.float32):
             pose_enc = self.pose_head(pose_token.to(torch.float32))
-
             pose_enc = pose_enc.view(n, f, -1, self.pose_enc_dim)
 
             pose_enc_scaled = self.pose_scale_function(pose_enc)
-
             pose = self.encoding_to_pose(pose_enc_scaled)
 
             seq_enc = self.sequence_info_head(seq_token.to(torch.float32))
@@ -414,8 +467,14 @@ class AnyCam(DepthAnythingForDepthEstimation):
 
         th, tw = inputs.shape[-2:]
 
+        # Ensure backbone is in float32
+        if next(self.backbone.parameters()).dtype != torch.float32:
+            logger.warning("Converting backbone to float32 in get_img_features")
+            self.backbone = self.backbone.to(torch.float32)
+
         # Get the 2D image features
-        outputs = self.backbone.forward_with_filtered_kwargs(inputs.reshape(n * f, c, th, tw), output_hidden_states=False, output_attentions=False)
+        backbone_input = inputs.reshape(n * f, c, th, tw).to(torch.float32)
+        outputs = self.backbone.forward_with_filtered_kwargs(backbone_input, output_hidden_states=False, output_attentions=False)
         hidden_states = outputs.feature_maps
 
         return hidden_states

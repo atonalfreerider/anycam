@@ -18,7 +18,7 @@ from dotdict import dotdict
 
 from anycam.common.geometry import get_grid_xy
 from anycam.common.scheduler import make_scheduler
-from anycam.common.image_processor import  make_image_processor
+from anycam.common.image_processor import make_image_processor
 
 from anycam.training.base_trainer import base_training
 
@@ -27,11 +27,10 @@ from anycam.models import make_depth_aligner, make_depth_predictor, make_pose_pr
 
 from anycam.loss import make_loss
 
-
 import warnings
+
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
-
 
 # can_compile = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 7
 can_compile = False
@@ -41,7 +40,8 @@ logger = logging.getLogger(__name__)
 
 @torch.compile(disable=not can_compile)
 def make_proj_from_focal_length(focal_length, aspect_ratio=1.0):
-    proj = torch.eye(3, device=focal_length.device).view(*((1,) * len(focal_length.shape)), 3, 3).repeat(*focal_length.shape, 1, 1)
+    proj = torch.eye(3, device=focal_length.device).view(*((1,) * len(focal_length.shape)), 3, 3).repeat(
+        *focal_length.shape, 1, 1)
     proj[..., 0, 0] = focal_length
     proj[..., 1, 1] = focal_length * aspect_ratio
 
@@ -94,7 +94,7 @@ def induce_flow_dist(depths, projs, rel_poses, flow=None, compute_dist=False, re
 
     n, f, _, c, h, w = depths.shape
     _, num_candidates, _, _ = projs.shape
-    nfc = n * f * num_candidates    
+    nfc = n * f * num_candidates
 
     depths = depths.view(n, f, -1, c, h, w).expand(-1, -1, num_candidates, -1, -1, -1).reshape(nfc, 1, h, w)
     projs = projs.view(n, 1, num_candidates, 3, 3).expand(-1, f, -1, -1, -1).reshape(nfc, 3, 3)
@@ -132,7 +132,8 @@ def induce_flow_dist(depths, projs, rel_poses, flow=None, compute_dist=False, re
                 flow = flow.reshape(n, f, -1, 2, h, w).expand(-1, -1, num_candidates, -1, -1, -1)
                 corr_xy = xy.reshape(n, f, num_candidates, 2, h, w) + flow
 
-            corr_pts = F.grid_sample(unproj_pts[:, 1:].reshape(-1, 3, h, w), corr_xy[:, :-1].reshape(-1, 2, h, w).permute(0, 2, 3, 1), align_corners=False)
+            corr_pts = F.grid_sample(unproj_pts[:, 1:].reshape(-1, 3, h, w),
+                                     corr_xy[:, :-1].reshape(-1, 2, h, w).permute(0, 2, 3, 1), align_corners=False)
             corr_pts = corr_pts.reshape(n, f - 1, num_candidates, 3, h, w)
 
             diffs = pts[:, :-1, :, :3] - corr_pts
@@ -158,11 +159,11 @@ def subsample_pose_input(images, image_features, flow_occs, depths, poses, align
 
     device = images.device
 
-    indices = torch.randperm(f-2, device=device)
+    indices = torch.randperm(f - 2, device=device)
     indices = indices[: f - drop_n - 2] + 1
     indices = torch.sort(indices)[0]
-    indices = torch.cat((torch.tensor([0], device=device), indices, torch.tensor([f-1], device=device)))
-    
+    indices = torch.cat((torch.tensor([0], device=device), indices, torch.tensor([f - 1], device=device)))
+
     images = images[:, indices]
     image_features = image_features[:, indices]
     depths = depths[:, indices]
@@ -187,7 +188,8 @@ def subsample_pose_input(images, image_features, flow_occs, depths, poses, align
                 acc_occ = flow_occs_parts[0][:, 2:3] > .5
 
                 for j in range(1, len(flow_occs_parts)):
-                    flow_occ_resampled = F.grid_sample(flow_occs_parts[j], (xy + acc_flow).permute(0, 2, 3, 1), align_corners=False)
+                    flow_occ_resampled = F.grid_sample(flow_occs_parts[j], (xy + acc_flow).permute(0, 2, 3, 1),
+                                                       align_corners=False)
                     acc_flow = acc_flow + flow_occ_resampled[:, :2]
                     acc_occ = acc_occ & (flow_occ_resampled[:, 2:3] > .5)
 
@@ -224,16 +226,16 @@ def subsample_pose_input(images, image_features, flow_occs, depths, poses, align
 
         poses_parts.append(poses[:, i])
 
-    poses_sub.append(poses_parts[-1])        
+    poses_sub.append(poses_parts[-1])
 
     poses = torch.stack(poses_sub, dim=1)
 
     return images, image_features, flow_occs, depths, poses, aligned_depths
 
-    
+
 class AnyCamWrapper(nn.Module):
     def __init__(
-        self, config
+            self, config
     ) -> None:
         super().__init__()
 
@@ -259,7 +261,8 @@ class AnyCamWrapper(nn.Module):
         self.pose_predictor = make_pose_predictor(config["pose_predictor"])
         self.depth_aligner = make_depth_aligner(config["depth_aligner"])
 
-        self.image_processor = make_image_processor({"type": "flow_occlusion"}, flow_model=self.flow_model, use_provided_flow=self.use_provided_flow, pair_mode="sequential")
+        self.image_processor = make_image_processor({"type": "flow_occlusion"}, flow_model=self.flow_model,
+                                                    use_provided_flow=self.use_provided_flow, pair_mode="sequential")
 
         self.renderer = dotdict({"net": None})
         self.renderer.net = None
@@ -268,7 +271,7 @@ class AnyCamWrapper(nn.Module):
         self.z_far = config.get("z_far", 10)
 
         self._counter = 0
-        
+
         for param in self.depth_predictor.parameters():
             param.requires_grad = False
 
@@ -283,37 +286,24 @@ class AnyCamWrapper(nn.Module):
         device = images.device
 
         # Normalize projection matrices
-        # We assume that all frames from a sequence have the same projection matrix
         gt_projs = normalize_proj(gt_projs[:, 0], h, w)
 
-        # Get depth and flow either from the dataset (preprocessed) or from the model
-        
-        if self.use_provided_depth:
-            depths = data["depths"]
-
-        else:
-            depth_in = images.view(n * f, c, h, w)
-
-            with torch.no_grad():
-                depths, depth_features = self.depth_predictor(depth_in, return_features=True)
-            depths = depths[0]
-
-            depths = 1 / depths.clamp_min(1e-3).view(n, -1, 1, *depths.shape[-2:])
-            depth_features = depth_features.view(n, -1, *depth_features.shape[1:])
+        # Always use precomputed depths
+        depths = data["depths"]
 
         data["pred_depths"] = depths * .1
         data["pred_depths_list"] = [depths]
 
-        images_ip_fwd, images_ip_bwd = self.image_processor(images * 2 - 1, data=data) # Legacy image processor. Requires images in range -1 to 1
+        images_ip_fwd, images_ip_bwd = self.image_processor(images * 2 - 1,
+                                                            data=data)  # Legacy image processor. Requires images in range -1 to 1
 
         flow_occ_fwd = images_ip_fwd[:, :, 3:6]
         flow_occ_bwd = images_ip_bwd[:, :, 3:6]
 
-        # img_features = self.pose_predictor.get_img_features(images)
         img_features = torch.zeros_like(images)
 
         # Build input data for pose predictor
-        
+
         if self.train_directions == "forward":
             directions = ["forward"]
         elif self.train_directions == "backward":
@@ -370,26 +360,28 @@ class AnyCamWrapper(nn.Module):
         poses = pose_result["poses"]
         focal_length = pose_result["focal_length"]
         focal_length_candidates = pose_result["focal_length_candidates"]
-        focal_length_probs = pose_result["focal_length_probs"]  
+        focal_length_probs = pose_result["focal_length_probs"]
         scaling_feature = pose_result["scaling_feature"]
 
         # This has shape (n, num_candidates, 3, 3)
         # If we only use the provided focal length, we should have only one candidate
         if self.try_focal_length_candidates:
-            proj_candidates = make_proj_from_focal_length(focal_length_candidates, w/h)
+            proj_candidates = make_proj_from_focal_length(focal_length_candidates, w / h)
 
             if self.single_focal_warmup_iters > 0 and self.training and "iteration" in data:
                 curr_iter = data["iteration"][0].item()
                 if curr_iter <= self.single_focal_warmup_iters:
-                    logger.warning(f"Using single focal length at {curr_iter}/{self.single_focal_warmup_iters} iterations")
+                    logger.warning(
+                        f"Using single focal length at {curr_iter}/{self.single_focal_warmup_iters} iterations")
                     # num_candidates = focal_length_candidates.shape[1]
                     # proj_candidates = proj_candidates[:, num_candidates//2:num_candidates//2+1].expand(-1, num_candidates, -1, -1)
-                    pose_result["poses"][..., :3, :3] = torch.eye(3, device=device).view(1, 1, 1, 3, 3).repeat(*pose_result["poses"].shape[:-2], 1, 1)
+                    pose_result["poses"][..., :3, :3] = torch.eye(3, device=device).view(1, 1, 1, 3, 3).repeat(
+                        *pose_result["poses"].shape[:-2], 1, 1)
                     # uncert = torch.ones_like(uncert)
                     # pose_result["uncert"] = uncert
 
         else:
-            proj_candidates = make_proj_from_focal_length(focal_length.unsqueeze(-1), w/h)
+            proj_candidates = make_proj_from_focal_length(focal_length.unsqueeze(-1), w / h)
 
         # If we only use the provided focal length, we replace the candidates with the provided focal length
         if self.use_provided_proj:
@@ -418,7 +410,7 @@ class AnyCamWrapper(nn.Module):
             best_focal_length_index = torch.zeros(n, device=device, dtype=torch.long)
         else:
             if "target_focal" in kwargs:
-                target_focal = kwargs["target_focal"] 
+                target_focal = kwargs["target_focal"]
                 best_focal_length_index = (pose_result["focal_length_candidates"] - target_focal).abs().argmin(dim=-1)
             else:
                 best_focal_length_index = torch.argmax(focal_length_probs[:, 0], dim=-1)
@@ -432,12 +424,12 @@ class AnyCamWrapper(nn.Module):
             selected_poses = poses[:, :, 0]
         else:
             selected_poses = poses[torch.arange(n, device=device), :, best_focal_length_index]
-        
+
         if aligned_depths.shape[2] == 1:
             selected_aligned_depths = aligned_depths[:, :, 0]
         else:
             selected_aligned_depths = aligned_depths[torch.arange(n, device=device), :, best_focal_length_index]
-        
+
         if uncert.shape[2] == 1:
             selected_uncert = uncert[:, :, 0]
         else:
@@ -458,7 +450,7 @@ class AnyCamWrapper(nn.Module):
 
         if self.training:
             self._counter += 1
-            
+
         return data
 
     def __deepcopy__(self, memo):
@@ -500,7 +492,7 @@ def get_subset(config, len_dataset: int):
 def get_dataflow(config):
     if idist.get_local_rank() > 0:
         idist.barrier()
-    
+
     train_dataset_list = config["dataset"]
     val_dataset_list = config.get("val_dataset", train_dataset_list)
     vis_dataset_list = config.get("vis_dataset", train_dataset_list)
@@ -522,11 +514,12 @@ def get_dataflow(config):
         train_datasets[dataset_name] = train_dataset
         test_datasets[dataset_name] = test_dataset
 
-    train_dataset = torch.utils.data.ConcatDataset([train_datasets[dataset_name] for dataset_name in train_dataset_list])
+    train_dataset = torch.utils.data.ConcatDataset(
+        [train_datasets[dataset_name] for dataset_name in train_dataset_list])
 
     weights = []
     weights_info = []
-    
+
     for dataset_name in train_dataset_list:
         weights.extend([1 / len(train_datasets[dataset_name]) / len(dataset_cfgs)] * len(train_datasets[dataset_name]))
         weights_info.append((dataset_name, len(train_datasets[dataset_name])))
@@ -568,11 +561,12 @@ def get_dataflow(config):
             dataset.return_flow = return_flow
 
             if "subset" in validation_config:
-                dataset._datapoints = [dataset._datapoints[i] for i in get_subset(validation_config["subset"], len(dataset))]
+                dataset._datapoints = [dataset._datapoints[i] for i in
+                                       get_subset(validation_config["subset"], len(dataset))]
                 dataset.length = len(dataset._datapoints)
             # else:
-                # subset = dataset
-            
+            # subset = dataset
+
             validation_loaders[f"{name}/{dataset.NAME}"] = idist.auto_dataloader(
                 dataset,
                 batch_size=validation_config.get("batch_size", 1),
@@ -597,7 +591,7 @@ def get_custom_trainer_events(config):
             dataloader = engine.state.dataloader
 
             sampler = dataloader.sampler
-            
+
             if isinstance(sampler, torch.utils.data.distributed.DistributedSampler):
                 sampler = sampler.sampler
 
@@ -619,9 +613,9 @@ def get_custom_trainer_events(config):
             new_weights = new_weights / len(active_datasets)
 
             sampler.weights = new_weights
-            
+
         trainer_events.append((Events.EPOCH_STARTED, update_dataloading_weights))
-    
+
     return trainer_events
 
 
@@ -634,7 +628,40 @@ def initialize(config: dict):
         training_steps = [int(ckpt.stem.split(prefix)[1]) for ckpt in ckpts]
         if training_steps:
             config["training"]["resume_from"] = (
-                Path(config["output"]["path"]) / f"{prefix}{max(training_steps)}.pt"
+                    Path(config["output"]["path"]) / f"{prefix}{max(training_steps)}.pt"
+            )
+
+    seed = 1
+    torch.random.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    model_conf = config["model"]
+
+    model = AnyCamWrapper(model_conf)
+
+    model = idist.auto_model(model, find_unused_parameters=True)
+
+    params = [param for name, param in model.named_parameters() if "image_processor" not in name]
+
+    optimizer = optim.Adam(
+        params, **config["training"]["optimizer"]["args"]
+    )
+    optimizer = idist.auto_optim(optimizer)
+
+    lr_scheduler = make_scheduler(config["training"].get("scheduler", {}), optimizer)
+
+    criterion = [make_loss(cfg) for cfg in config.get("loss", [])]
+
+    return model, optimizer, criterion, lr_scheduler
+    if config["training"].get("continue", False):
+        prefix = "training_checkpoint_"
+        ckpts = Path(config["output"]["path"]).glob(f"{prefix}*.pt")
+        # TODO: probably correct logic but please check
+        training_steps = [int(ckpt.stem.split(prefix)[1]) for ckpt in ckpts]
+        if training_steps:
+            config["training"]["resume_from"] = (
+                    Path(config["output"]["path"]) / f"{prefix}{max(training_steps)}.pt"
             )
 
     seed = 1

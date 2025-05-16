@@ -263,44 +263,54 @@ class FlowOcclusionProcessor(nn.Module):
 
         assert self.pair_mode in ("one-to-many", "sequential"), f"Unknown pair mode: {self.pair_mode}"
 
-        # TODO: Temporary solution
-        if True or not self.use_existing_flow:
-            if self.flow_model == "raft":
-                raft_weights = Raft_Large_Weights.DEFAULT
-                self.raft_transforms = raft_weights.transforms()
-                self.raft = raft_large(raft_weights)
-                self.raft.eval()
+        # Initialize models as None for lazy loading
+        self._raft = None
+        self._raft_transforms = None
+        self._unimatch = None
 
-                for param in self.raft.parameters():
-                    param.requires_grad = False
+    @property
+    def raft(self):
+        if self._raft is None:
+            raft_weights = Raft_Large_Weights.DEFAULT
+            self._raft_transforms = raft_weights.transforms()
+            self._raft = raft_large(raft_weights)
+            self._raft.eval()
+            for param in self._raft.parameters():
+                param.requires_grad = False
+        return self._raft
+    
+    @property
+    def raft_transforms(self):
+        if self._raft_transforms is None:
+            _ = self.raft  # This will initialize both raft and transforms
+        return self._raft_transforms
 
-            elif self.flow_model == "unimatch":
-                from unimatch.unimatch import UniMatch
+    @property
+    def unimatch(self):
+        if self._unimatch is None:
+            from unimatch.unimatch import UniMatch
 
-                ckpt_path = os.path.join(os.environ["HOME"], ".cache", "torch", "checkpoints", "gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth")
-                logger.info(f"Loading pretrained model from {ckpt_path}")
-                if not os.path.exists(ckpt_path):
-                    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-                    logger.info(f"Downloading from https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth")
-                    r = requests.get('https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth')
-                    with open(ckpt_path , 'wb') as f:
-                        f.write(r.content)
-                self.unimatch = UniMatch(
-                    feature_channels=128,
-                    num_scales=2,
-                    upsample_factor=4,
-                    ffn_dim_expansion=4,
-                    num_transformer_layers=6,
-                    reg_refine=True,
-                    task="flow")
-                self.unimatch.load_state_dict(torch.load(ckpt_path)['model'], strict=True)
-                self.unimatch.eval()
-                for param in self.unimatch.parameters():
-                    param.requires_grad = False
-
-                # self.unimatch = torch.compile(self.unimatch)
-            else:
-                raise ValueError(f"Unknown flow model: {self.flow_model}")
+            ckpt_path = os.path.join(os.environ["HOME"], ".cache", "torch", "checkpoints", "gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth")
+            logger.info(f"Loading pretrained model from {ckpt_path}")
+            if not os.path.exists(ckpt_path):
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                logger.info(f"Downloading from https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth")
+                r = requests.get('https://s3.eu-central-1.amazonaws.com/avg-projects/unimatch/pretrained/gmflow-scale2-regrefine6-mixdata-train320x576-4e7b215d.pth')
+                with open(ckpt_path , 'wb') as f:
+                    f.write(r.content)
+            self._unimatch = UniMatch(
+                feature_channels=128,
+                num_scales=2,
+                upsample_factor=4,
+                ffn_dim_expansion=4,
+                num_transformer_layers=6,
+                reg_refine=True,
+                task="flow")
+            self._unimatch.load_state_dict(torch.load(ckpt_path)['model'], strict=True)
+            self._unimatch.eval()
+            for param in self._unimatch.parameters():
+                param.requires_grad = False
+        return self._unimatch
 
     def flow_raft(self, img0, img1):
         n, c, h, w = img0.shape
@@ -360,7 +370,12 @@ class FlowOcclusionProcessor(nn.Module):
             img0 = img0.permute(0, 1, 3, 2)
             img1 = img1.permute(0, 1, 3, 2)
 
-        results_dict = self.unimatch(img0, img1,
+        # Ensure UniMatch model is on the same device as inputs
+        unimatch_model = self.unimatch
+        if img0.is_cuda and not next(unimatch_model.parameters()).is_cuda:
+            unimatch_model = unimatch_model.cuda()
+
+        results_dict = unimatch_model(img0, img1,
                             attn_type=attn_type,
                             attn_splits_list=attn_splits_list,
                             corr_radius_list=corr_radius_list,
@@ -446,24 +461,7 @@ class FlowOcclusionProcessor(nn.Module):
 
     @property
     def device(self):
-        return next(self.parameters()).device
-
-
-class AutoMaskingWrapper(nn.Module):
-
-    # Adds the corresponding color from the input frame for reference
-    def __init__(self, image_processor):
-        super().__init__()
-        self.image_processor = image_processor
-
-        self.channels = self.image_processor.channels + 1
-
-    def forward(self, images, threshold):
-        n, v, c, h, w = images.shape
-        processed_images = self.image_processor(images)
-        thresholds = threshold.view(n, 1, 1, h, w).expand(n, v, 1, h, w)
-        processed_images = torch.stack((processed_images, thresholds), dim=2)
-        return processed_images
+        return next(self.parameters()).device if list(self.parameters()) else torch.device('cpu')
 
 
 CANONICAL_PROJ = torch.tensor(
