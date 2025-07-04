@@ -283,7 +283,26 @@ class AnyCam(DepthAnythingForDepthEstimation):
 
         # Prepare inputs with memory optimization
         inputs = [images.to(torch.float32)]
-        inputs += [flow_occs[:, :, :2].to(torch.float32), depths.to(torch.float32)]
+        
+        # Validate inputs for NaN/Inf
+        if torch.isnan(images).any() or torch.isinf(images).any():
+            print("Warning: NaN or Inf detected in input images")
+            images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
+            inputs = [images.to(torch.float32)]
+        
+        if flow_occs is not None:
+            if torch.isnan(flow_occs).any() or torch.isinf(flow_occs).any():
+                print("Warning: NaN or Inf detected in flow_occs")
+                flow_occs = torch.nan_to_num(flow_occs, nan=0.0, posinf=1.0, neginf=0.0)
+            inputs.append(flow_occs[:, :, :2].to(torch.float32))
+        
+        if depths is not None:
+            if torch.isnan(depths).any() or torch.isinf(depths).any():
+                print("Warning: NaN or Inf detected in depths")
+                depths = torch.nan_to_num(depths, nan=1.0, posinf=100.0, neginf=0.01)
+            depths = torch.clamp(depths, min=0.01, max=100.0)  # Clamp depth range
+            inputs.append(depths.to(torch.float32))
+        
         inputs = torch.cat(inputs, dim=2)
         
         # Clear intermediate tensors
@@ -380,6 +399,9 @@ class AnyCam(DepthAnythingForDepthEstimation):
 
         uncertainty = F.softplus(uncertainty)
         uncertainty = uncertainty.reshape(n, f, -1, self.out_uncertainty_dim, h, w)
+        
+        # Clamp uncertainty to prevent explosion
+        uncertainty = torch.clamp(uncertainty, min=1e-6, max=100.0)
 
         # Predict poses
         pose_tokens = self.pose_reassemble_stage(pose_tokens)
@@ -425,12 +447,18 @@ class AnyCam(DepthAnythingForDepthEstimation):
             pose_enc = self.pose_head(pose_token.to(torch.float32))
             pose_enc = pose_enc.view(n, f, -1, self.pose_enc_dim)
 
+            # Clamp pose encoding to prevent explosion
+            pose_enc = torch.clamp(pose_enc, min=-10, max=10)
+
             pose_enc_scaled = self.pose_scale_function(pose_enc)
             pose = self.encoding_to_pose(pose_enc_scaled)
 
             seq_enc = self.sequence_info_head(seq_token.to(torch.float32))
             focal_enc = seq_enc[..., :self.focal_enc_dim]
             scaling_feature = seq_enc[..., self.focal_enc_dim:]
+
+            # Clamp focal encoding
+            focal_enc = torch.clamp(focal_enc, min=-10, max=10)
 
             scaling_feature = scaling_feature.view(n, -1, self.scaling_feature_dim)
 

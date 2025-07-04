@@ -1,9 +1,9 @@
 import numpy as np
 import uuid
+from pathlib import Path
 
 import rerun as rr
 from anycam.common.geometry import get_grid_xy
-from anycam.visualization.common import color_tensor
 
 import torch
 
@@ -12,14 +12,13 @@ def plot_to_rerun(
         depths,
         imgs,
         proj,
-        uncertainties=None,
         subsample_pts=1,
         radii=1.5,
-        uncertainty_thresh=-1,
         max_depth=-1,
         filter_depth_threshold=0.1,
         image_plane_distance=0.05,
         rerun_mode="spawn",
+        depth_dir=None,
 ):
 
     h, w = imgs[0].shape[:2]
@@ -52,7 +51,11 @@ def plot_to_rerun(
             align_corners=False
         ).squeeze(0)
 
-        proj = proj.clone().detach().to(device).float()
+        # Convert proj to tensor if it's a numpy array
+        if isinstance(proj, np.ndarray):
+            proj = torch.from_numpy(proj).to(device).float()
+        else:
+            proj = proj.clone().detach().to(device).float()
 
         proj_normalized = proj.clone()
         proj_normalized[0, 0] = proj_normalized[0, 0] / w * 2
@@ -66,7 +69,14 @@ def plot_to_rerun(
         pts = inv_proj @ pts
         pts = pts * depth.view(1, -1).to(device)
         pts = torch.cat((pts, torch.ones(1, h * w, device=device)), dim=0)
-        pts = pose.to(pts.dtype) @ pts
+        
+        # Convert pose to tensor if it's a numpy array
+        if isinstance(pose, np.ndarray):
+            pose = torch.from_numpy(pose).to(device).float()
+        else:
+            pose = pose.to(device).float()
+            
+        pts = pose @ pts
         pts = pts[:3, :].T
 
         colors = torch.from_numpy(img.reshape(-1, 3)).to(device)
@@ -98,8 +108,50 @@ def plot_to_rerun(
     )
     rr.send_blueprint(blueprint, make_active=True)
 
+    # Load depths from depth_dir if provided, otherwise use passed depths
+    if depth_dir is not None and Path(depth_dir).exists():
+        print(f"Loading depths from depth_dir: {depth_dir}")
+        from anycam.models.depth_predictor_wrapper import NPZDepthWrapper
+        
+        depth_loader = NPZDepthWrapper({
+            "depth_dir": depth_dir,
+            "scaling": 1.0,
+            "frame_pattern": "depth_{:06d}.npz",
+            "depth_key": "depth"
+        })
+        
+        # Load all depths for the trajectory
+        loaded_depths = []
+        for frame_idx in range(len(trajectory)):
+            try:
+                depth_np = depth_loader._load_depth_frame(frame_idx)
+                depth_tensor = torch.from_numpy(depth_np).unsqueeze(0)  # Add channel dimension
+                loaded_depths.append(depth_tensor)
+            except Exception as e:
+                print(f"Warning: Could not load depth for frame {frame_idx}: {e}")
+                # Create dummy depth
+                dummy_depth = torch.ones(1, h, w) * 1.0
+                loaded_depths.append(dummy_depth)
+        
+        depths = loaded_depths
+        print(f"Loaded {len(depths)} depth maps from depth_dir")
+    elif depths is None:
+        depths = []
+        print("Warning: No depths available for visualization")
+
     # Calculate mapping between trajectory indices and depth/keyframe indices
     print(f"Visualization info: {len(trajectory)} poses, {len(depths)} depths, {len(imgs)} images")
+    
+    # Validate that we have enough data for visualization
+    if len(depths) == 0:
+        print("Warning: No depths available for visualization")
+    elif len(depths) != len(trajectory):
+        print(f"Warning: Depth count ({len(depths)}) doesn't match trajectory count ({len(trajectory)})")
+        print("This may cause visualization to stop early")
+    
+    if len(imgs) != len(trajectory):
+        print(f"Info: Image count ({len(imgs)}) doesn't match trajectory count ({len(trajectory)})")
+        print("Images will be reused/sampled to match trajectory length")
 
     for traj_id in range(len(trajectory)):
         rr.set_time_sequence("step", traj_id)
@@ -124,18 +176,19 @@ def plot_to_rerun(
                rr.LineStrips3D([pose[:3, 3].cpu().numpy().tolist() for pose in trajectory[:traj_id + 1]],
                                colors=[(0, 255, 0)]), static=False)
 
-        # Map trajectory index to image and depth indices
-        img_id = min(traj_id, len(imgs) - 1)  # Direct mapping for images
+        # Map trajectory index to image and depth indices with bounds checking
+        if len(imgs) > 0:
+            # Sample image index proportionally if we have fewer images than trajectory poses
+            img_id = min(int(traj_id * len(imgs) / len(trajectory)), len(imgs) - 1)
+        else:
+            img_id = 0
 
-        # For depths, use the keyframe mapping if available
-        depth_id = traj_id
+        # For depths, ensure we don't go out of bounds
+        depth_id = min(traj_id, len(depths) - 1) if depths else None
 
-        # Ensure depth_id is within bounds
-        if depth_id is not None:
-            depth_id = min(max(depth_id, 0), len(depths) - 1)
-
-        rr.log("world/scene/active_cam/input",
-               rr.Image((imgs[img_id] * 255).astype(np.uint8)).compress(jpeg_quality=95))
+        if len(imgs) > 0:
+            rr.log("world/scene/active_cam/input",
+                   rr.Image((imgs[img_id] * 255).astype(np.uint8)).compress(jpeg_quality=95))
 
         rr.log("world/scene",
                rr.Transform3D(translation=pose[:3, 3].cpu(), mat3x3=rot, axis_length=0, from_parent=True))
@@ -145,6 +198,10 @@ def plot_to_rerun(
             try:
                 # Get the depth for this frame
                 depth = depths[depth_id]
+
+                # Debug: Print depth info for first few frames
+                if traj_id < 5:
+                    print(f"Frame {traj_id}: Using depth {depth_id}, depth shape: {depth.shape}, mean: {depth.mean():.6f}")
 
                 # Ensure depth is on CUDA and has proper dimensions
                 depth = depth.cuda()
@@ -160,60 +217,35 @@ def plot_to_rerun(
                     align_corners=False
                 ).squeeze(0).squeeze(0)
 
-                # Lift points from depth
-                pts, colors = lift_image(imgs[img_id], depth, trajectory[traj_id].cuda(), proj)
+                # Lift points from depth only if we have images
+                if len(imgs) > 0:
+                    pts, colors = lift_image(imgs[img_id], depth, trajectory[traj_id].cuda(), proj)
 
-                # Compute mask on the depth
-                mask = filter_depth(depth, threshold=filter_depth_threshold)
-                mask = mask.view(-1)
+                    # Compute mask on the depth
+                    mask = filter_depth(depth, threshold=filter_depth_threshold)
+                    mask = mask.view(-1)
 
-                if max_depth > 0:
-                    depth_mask = depth.view(-1) < max_depth
-                    mask = mask & depth_mask
+                    if max_depth > 0:
+                        depth_mask = depth.view(-1) < max_depth
+                        mask = mask & depth_mask
 
-                # Apply mask to points and colors
-                if len(pts) > 0:
-                    pts = pts[mask, :]
-                    colors = colors[mask, :]
-
-                    # Subsample points
+                    # Apply mask to points and colors
                     if len(pts) > 0:
-                        pts = pts[subsample_pts // 2::subsample_pts]
-                        colors = colors[subsample_pts // 2::subsample_pts]
-                        colors = (colors * 255).clamp(0, 255).to(torch.uint8)
+                        pts = pts[mask, :]
+                        colors = colors[mask, :]
 
-                        rr.log(f"world/scene/active_points",
-                               rr.Points3D(pts[:, :3].cpu().numpy(), colors=colors[:, :3].cpu().numpy(),
-                                           radii=rr.Radius.ui_points([radii]), ))
+                        # Subsample points
+                        if len(pts) > 0:
+                            pts = pts[subsample_pts // 2::subsample_pts]
+                            colors = colors[subsample_pts // 2::subsample_pts]
+                            colors = (colors * 255).clamp(0, 255).to(torch.uint8)
+
+                            rr.log(f"world/scene/active_points",
+                                   rr.Points3D(pts[:, :3].cpu().numpy(), colors=colors[:, :3].cpu().numpy(),
+                                               radii=rr.Radius.ui_points([radii]), ))
 
             except Exception as e:
                 print(f"Warning: Failed to lift points for frame {traj_id}: {e}")
-
-        # Show uncertainty if available
-        if uncertainties is not None and traj_id < len(uncertainties):
-            try:
-                uncert = uncertainties[traj_id]
-
-                # Handle uncertainty dimensions
-                uncert = uncert.squeeze(0)
-
-                # Resize uncertainty to match image dimensions if needed
-                uncert = torch.nn.functional.interpolate(
-                    uncert.unsqueeze(0).unsqueeze(0),
-                    size=(h, w),
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(0).squeeze(0)
-
-                uncertainty_img = color_tensor((uncert / uncertainty_thresh).clamp(0, 1), cmap="plasma", norm=False)[0]
-
-                uncertainty_img = uncertainty_img.cpu().numpy()
-                uncertainty_img = (uncertainty_img * 255).astype(np.uint8)
-
-                # Transpose to HWC format for rerun
-                uncertainty_img = uncertainty_img.transpose(1, 2, 0)
-
-                rr.log(f"world/scene/active_cam/uncertainty", rr.Image(uncertainty_img))
-
-            except Exception as e:
-                print(f"Warning: Failed to show uncertainty for frame {traj_id}: {e}")
+        else:
+            if traj_id < 5:  # Only print for first few frames to avoid spam
+                print(f"Frame {traj_id}: No depth available (depth_id={depth_id}, depths_len={len(depths)})")

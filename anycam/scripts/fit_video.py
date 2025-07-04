@@ -166,6 +166,27 @@ def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None, start_frame_idx
     # Always use NPZ depth predictor
     depth_predictor = model.depth_predictor if hasattr(model, 'depth_predictor') else model.model.depth_predictor
 
+    # Process all frames to get depths for each frame, not just pairs
+    all_imgs = imgs if imgs is not None else torch.cat([imgs0, imgs1[-1:]], dim=0)
+    
+    print(f"compute_depth_flow: Processing {len(all_imgs)} frames for depths")
+    
+    # Load depths for ALL frames first
+    all_depths = []
+    for i, img in enumerate(all_imgs):
+        frame_idx = start_frame_idx + i * frame_step
+        depth = depth_predictor(
+            img.unsqueeze(0).cuda(), 
+            frame_indices=[frame_idx]
+        )[0]
+        depth = depth.squeeze(0)
+        all_depths.append(depth.clone().cpu())
+        
+        # Debug output for first few frames
+        if i < 5:
+            print(f"  Loaded depth for frame {i} (global frame {frame_idx}): mean={depth.mean():.6f}")
+    
+    # Now process flow for pairs
     for (i, (img0, img1)) in tqdm(list(enumerate(zip(imgs0, imgs1)))):
         frame_idx_0 = start_frame_idx + i * frame_step
         frame_idx_1 = start_frame_idx + (i + 1) * frame_step
@@ -176,15 +197,9 @@ def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None, start_frame_idx
         del img_pair
         torch.cuda.empty_cache()
 
-        # Always use NPZ depth predictor
-        depth = depth_predictor(
-            img0.unsqueeze(0).cuda(), 
-            frame_indices=[frame_idx_0]
-        )[0]
-        depth = depth.squeeze(0)
-        depth_clone = depth.clone()
-
+        # Add the corresponding image and depth
         seq_imgs.append(img0.cpu())
+        seq_depths.append(all_depths[i])  # Use pre-loaded depth
 
         if imgs is not None:
             seq_flow_occs_fwd.append(images_ip_fwd[0, :(1 if i != len(imgs0)-1 else 2), 3:6].cpu())
@@ -192,34 +207,22 @@ def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None, start_frame_idx
         else:
             seq_flow_occs_fwd.append(images_ip_fwd[0, :1, 3:6].cpu())
             seq_flow_occs_bwd.append(images_ip_bwd[0, 1:, 3:6].cpu())
-
-        seq_depths.append(depth_clone.cpu())
         
-        del images_ip_fwd, images_ip_bwd, depth, depth_clone
+        del images_ip_fwd, images_ip_bwd
         torch.cuda.empty_cache()
 
+    # Add the last frame and its depth
     if imgs is not None:
-        last_frame_idx = start_frame_idx + len(imgs0) * frame_step
-        print(f"compute_depth_flow: Processing last frame, frame index: {last_frame_idx}")
+        seq_imgs.append(imgs1[-1].cpu())
+        seq_depths.append(all_depths[-1])  # Use the last pre-loaded depth
         
-        depth = depth_predictor(
-            img1.unsqueeze(0).cuda(), 
-            frame_indices=[last_frame_idx]
-        )[0]
-        depth = depth.squeeze(0)
-        depth_clone = depth.clone()
-
-        seq_imgs.append(img1.cpu())
-        seq_depths.append(depth_clone.cpu())
-        
-        del depth, depth_clone
-        torch.cuda.empty_cache()
+        print(f"compute_depth_flow: Added last frame depth, total depths: {len(seq_depths)}")
 
     # Stack tensors and verify depth-frame alignment
     seq_imgs = torch.stack(seq_imgs, dim=0)
     seq_depths_stacked = []
     for i, depth in enumerate(seq_depths):
-        actual_frame_idx = start_frame_idx + i
+        actual_frame_idx = start_frame_idx + i * frame_step
         
         if depth.dim() == 3 and depth.shape[0] == 1:
             seq_depths_stacked.append(depth)
@@ -235,7 +238,7 @@ def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None, start_frame_idx
     print(f"compute_depth_flow: Final sequences - imgs: {seq_imgs.shape}, depths: {seq_depths.shape}")
     print(f"compute_depth_flow: Frame-to-depth verification:")
     for i in range(min(5, seq_depths.shape[0])):
-        actual_frame_idx = start_frame_idx + i
+        actual_frame_idx = start_frame_idx + i * frame_step
         frame_depth = seq_depths[i]
         print(f"  Seq index {i} = Frame {actual_frame_idx}: depth mean {frame_depth.mean():.6f}")
 
@@ -244,7 +247,7 @@ def compute_depth_flow(model, imgs=None, imgs0=None, imgs1=None, start_frame_idx
 
 @torch.autocast(device_type="cuda", enabled=True)
 @torch.no_grad()
-def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False, gt_proj=None):
+def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False, gt_proj=None, start_frame_offset=0):
 
     print(config)
 
@@ -277,6 +280,7 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
     print(f"shift: {shift}")
     print(f"proj_strategy: {proj_strategy}")
     print(f"proj_label_source: {proj_label_source}")
+    print(f"start_frame_offset: {start_frame_offset}")
 
     dataset = make_dataset(dataset_config, imgs, device="cpu")
 
@@ -304,7 +308,10 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
     if square_crop:
         seq_imgs = seq_imgs[:, :, (h-sq)//2:(h-sq)//2+sq, (w-sq)//2:(w-sq)//2+sq]
 
-    seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(model, seq_imgs, start_frame_idx=0)
+    # Pass start_frame_offset to compute_depth_flow
+    seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(
+        model, seq_imgs, start_frame_idx=start_frame_offset
+    )
     
     def prepare_batch(batch_ids_ids):
         batch_size, frame_count = batch_ids_ids.shape
@@ -687,8 +694,13 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
             # with the same spacing from the NPZ files
             print(f"BA refinement: Loading depths with frame step={ba_refinement_level}")
             
+            # CRITICAL FIX: Use the correct start_frame_idx for BA refinement
+            # We need to account for the batch offset when loading depths for BA
+            ba_start_frame_idx = start_frame_offset + (start_frame_offset % ba_refinement_level)
+            print(f"BA refinement: Using start_frame_idx={ba_start_frame_idx} for batch offset {start_frame_offset}")
+            
             seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd = compute_depth_flow(
-                model, seq_imgs, start_frame_idx=0, frame_step=ba_refinement_level
+                model, seq_imgs, start_frame_idx=ba_start_frame_idx, frame_step=ba_refinement_level
             )
 
         else:
@@ -852,6 +864,11 @@ def compute_loss(ba_param_inv_depth, ba_param_rot, ba_param_t, ba_param_focal_le
 @torch.autocast(device_type="cuda", dtype=torch.float32)
 @torch.enable_grad()
 def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq_depths, seq_flow_occs_fwd, seq_flow_occs_bwd, device="cuda"):
+    # Enable TensorFloat32 for better performance on modern GPUs
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
+        print("Enabled TensorFloat32 for improved matrix multiplication performance")
+    
     with_rerun = config.get("with_rerun", True)
     ba_window = config.get("ba_window", 8) # 8
     overlap = config.get("overlap", 6) # 4
@@ -866,7 +883,7 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
 
     n_steps_sliding = config.get("n_steps_sliding", 400) # 500 # 250
     n_steps_global = config.get("n_steps_global", 100) # 1000 # 100
-    n_steps_last_global = config.get("n_steps_last_global", 5000) # 5000
+    n_steps_last_global = config.get("n_steps_last_global", 2000) # 5000
     n_steps_only_focal = config.get("n_steps_only_focal", 0) # 1000
 
     all_reg_to_zero = config.get("all_reg_to_zero", True)
@@ -882,6 +899,25 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
 
     log_interval = config.get("log_interval", 200)
     rerun_offset = 10
+    
+    # Check for NaN/Inf in inputs
+    trajectory_array = np.array(initial_trajectory)
+    if np.isnan(trajectory_array).any() or np.isinf(trajectory_array).any():
+        print("ERROR: NaN or Inf detected in initial trajectory. Skipping BA refinement.")
+        return torch.tensor(initial_trajectory), proj, {}
+    
+    if np.isnan(proj).any() or np.isinf(proj).any():
+        print("ERROR: NaN or Inf detected in projection matrix. Skipping BA refinement.")
+        return torch.tensor(initial_trajectory), proj, {}
+    
+    # Check depths for validity
+    for i, depth in enumerate(seq_depths):
+        if torch.isnan(depth).any() or torch.isinf(depth).any():
+            print(f"ERROR: NaN or Inf detected in depth {i}. Skipping BA refinement.")
+            return torch.tensor(initial_trajectory), proj, {}
+        if (depth <= 0).any():
+            print(f"Warning: Non-positive depth values detected in depth {i}. Clamping to minimum.")
+            seq_depths[i] = torch.clamp(depth, min=0.01)
     
     # print all parameters
     print(f"ba_window: {ba_window}")
@@ -911,8 +947,13 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
 
     track_len = min(track_len, seq_len)
 
-    initial_depths_fwd, pixel_tracks_fwd, uncerts_fwd, indices_fwd, depths_fwd, rgbs_fwd = compute_pixel_tracks(seq_flow_occs_fwd.cuda(), uncertainties, seq_depths.cuda(), track_len=track_len, stride=stride, grid_size=grid_size, imgs=seq_imgs.cuda(), long_tracks=long_tracks)
-    initial_depths_bwd, pixel_tracks_bwd, uncerts_bwd, indices_bwd, depths_bwd, rgbs_bwd = compute_pixel_tracks(seq_flow_occs_bwd.cuda(), uncertainties, seq_depths.cuda(), track_len=track_len, stride=stride, grid_size=grid_size, is_backward=True, imgs=seq_imgs.cuda(), long_tracks=long_tracks)
+    try:
+        initial_depths_fwd, pixel_tracks_fwd, uncerts_fwd, indices_fwd, depths_fwd, rgbs_fwd = compute_pixel_tracks(seq_flow_occs_fwd.cuda(), uncertainties, seq_depths.cuda(), track_len=track_len, stride=stride, grid_size=grid_size, imgs=seq_imgs.cuda(), long_tracks=long_tracks)
+        initial_depths_bwd, pixel_tracks_bwd, uncerts_bwd, indices_bwd, depths_bwd, rgbs_bwd = compute_pixel_tracks(seq_flow_occs_bwd.cuda(), uncertainties, seq_depths.cuda(), track_len=track_len, stride=stride, grid_size=grid_size, is_backward=True, imgs=seq_imgs.cuda(), long_tracks=long_tracks)
+    except Exception as e:
+        print(f"ERROR: Failed to compute pixel tracks: {e}. Skipping BA refinement.")
+        return torch.tensor(initial_trajectory), proj, {}
+
     initial_depths = torch.cat([initial_depths_fwd, initial_depths_bwd], dim=1)
     pixel_tracks = torch.cat([pixel_tracks_fwd, pixel_tracks_bwd], dim=1)
     uncerts = torch.cat([uncerts_fwd, uncerts_bwd], dim=1)
@@ -926,6 +967,11 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
     indices = indices_fwd
     depths = depths_fwd
     rgbs = rgbs_fwd
+
+    # Check for NaN/Inf in computed tracks
+    if torch.isnan(pixel_tracks).any() or torch.isinf(pixel_tracks).any():
+        print("ERROR: NaN or Inf detected in pixel tracks. Skipping BA refinement.")
+        return torch.tensor(initial_trajectory), proj, {}
 
     n, wc, gs = initial_depths.shape
     n, wc, gs, tl, c = pixel_tracks.shape
@@ -947,11 +993,24 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
     ba_poses_c2w = torch.tensor(np.array(initial_trajectory)).unsqueeze(0).cuda()
     rel_poses = torch.inverse(ba_poses_c2w[:, :-1]) @ ba_poses_c2w[:, 1:]
 
-    ba_param_inv_depth = 1 / initial_depths
+    ba_param_inv_depth = 1 / torch.clamp(initial_depths, min=0.01)  # Clamp to avoid division by zero
 
     ba_param_rot, ba_param_t = pose_to_param(ba_poses_c2w, rotation_representation)
 
-    ba_param_focal_length = (torch.tensor(proj[0, 0] / w * 2, device=device)).log() / 2
+    ba_param_focal_length = torch.clamp((torch.tensor(proj[0, 0] / w * 2, device=device)).log() / 2, min=-10, max=10)  # Clamp focal length
+
+    # Check parameters for NaN/Inf before optimization
+    if torch.isnan(ba_param_inv_depth).any() or torch.isinf(ba_param_inv_depth).any():
+        print("ERROR: NaN or Inf in ba_param_inv_depth. Skipping BA refinement.")
+        return torch.tensor(initial_trajectory), proj, {}
+    
+    if torch.isnan(ba_param_rot).any() or torch.isinf(ba_param_rot).any():
+        print("ERROR: NaN or Inf in ba_param_rot. Skipping BA refinement.")
+        return torch.tensor(initial_trajectory), proj, {}
+    
+    if torch.isnan(ba_param_t).any() or torch.isinf(ba_param_t).any():
+        print("ERROR: NaN or Inf in ba_param_t. Skipping BA refinement.")
+        return torch.tensor(initial_trajectory), proj, {}
 
     ba_param_inv_depth.requires_grad = True
     ba_param_rot.requires_grad = True
@@ -987,7 +1046,7 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
     overlap = config.get("overlap", 6)
     n_steps_sliding = config.get("n_steps_sliding", 400)
     n_steps_global = config.get("n_steps_global", 100)
-    n_steps_last_global = config.get("n_steps_last_global", 5000)
+    n_steps_last_global = config.get("n_steps_last_global", 2000)
     global_every_n = config.get("global_every_n", 2)
 
     # Estimate number of sliding and global steps
@@ -998,7 +1057,13 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
     # Use leave=False to prevent tqdm from printing a new bar on close, and dynamic_ncols for better IDE support
     ba_pbar = tqdm(total=total_ba_steps, desc="Bundle Adjustment", leave=False, dynamic_ncols=True)
 
+    nan_detected = False
+
     while optimized_until < seq_len or not last_global_done:
+        if nan_detected:
+            print("NaN detected during optimization. Stopping BA refinement.")
+            break
+            
         do_last_global = optimized_until >= seq_len
 
         if do_last_global:
@@ -1085,22 +1150,45 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
             ba_param_t_d = ba_param_t.clone()
             ba_param_t_d[~ba_param_pose_mask.expand_as(ba_param_t_d)] = ba_param_t_d[~ba_param_pose_mask.expand_as(ba_param_t_d)].detach()
 
-            repr_loss, smoothness_loss, ba_proj, xyzh_world = compute_loss(ba_param_inv_depth_d, ba_param_rot_d, ba_param_t_d, ba_param_focal_length, pixel_tracks, ba_indices, ba_uncerts, w, h, loss_mask, max_uncert)
+            try:
+                repr_loss, smoothness_loss, ba_proj, xyzh_world = compute_loss(ba_param_inv_depth_d, ba_param_rot_d, ba_param_t_d, ba_param_focal_length, pixel_tracks, ba_indices, ba_uncerts, w, h, loss_mask, max_uncert)
+            except Exception as e:
+                ba_pbar.write(f"Error in compute_loss: {e}. Stopping BA refinement.")
+                nan_detected = True
+                break
+
+            # Check for NaN/Inf in losses
+            if torch.isnan(repr_loss).any() or torch.isinf(repr_loss).any():
+                ba_pbar.write(f"NaN/Inf detected in repr_loss at step {step}. Stopping BA refinement.")
+                nan_detected = True
+                break
+            
+            if torch.isnan(smoothness_loss).any() or torch.isinf(smoothness_loss).any():
+                ba_pbar.write(f"NaN/Inf detected in smoothness_loss at step {step}. Stopping BA refinement.")
+                nan_detected = True
+                break
 
             if use_best:
                 thresh = torch.quantile(repr_loss[repr_loss > 0], 0.9)
                 repr_loss[repr_loss > thresh] = 0
 
             total_loss = repr_loss.mean() + smoothness_loss.mean() * (lambda_smoothness if do_global else 0)
+            
+            # Check total loss for NaN/Inf
+            if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
+                ba_pbar.write(f"NaN/Inf detected in total_loss at step {step}. Stopping BA refinement.")
+                nan_detected = True
+                break
 
             total_loss.backward()
 
-            # clip gradients
-
+            # clip gradients and check for NaN/Inf
             for param in [ba_param_inv_depth, ba_param_rot, ba_param_t, ba_param_focal_length]:
-                param.grad[torch.isnan(param.grad) | torch.isinf(param.grad)] = 0
+                if param.grad is not None:
+                    param.grad[torch.isnan(param.grad) | torch.isinf(param.grad)] = 0
+                    # Clamp gradients to prevent explosion
+                    param.grad = torch.clamp(param.grad, min=-10, max=10)
 
-            
             if do_global and step < n_steps_only_focal:
                 ba_param_rot.grad *= 0
                 ba_param_t.grad *= 0
@@ -1109,12 +1197,20 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
 
             optimizer.step()
 
+            # Clamp parameters after optimization step to prevent explosion
+            ba_param_inv_depth.data = torch.clamp(ba_param_inv_depth.data, min=0.01, max=100)
+            ba_param_focal_length.data = torch.clamp(ba_param_focal_length.data, min=-10, max=10)
+
             ba_pbar.update(1)
 
             if step == 0 or (step + 1) % 50 == 0:
-                ba_pbar.write(
-                    f"BA Step {ba_pbar.n}/{total_ba_steps} | l: {total_loss.item():.4f} | l_s: {smoothness_loss.item():.4f} | fx: {ba_proj[0, 0, 0].item():.2f} | fy: {ba_proj[0, 1, 1].item():.2f}"
-                )
+                if not nan_detected:
+                    ba_pbar.write(
+                        f"BA Step {ba_pbar.n}/{total_ba_steps} | l: {total_loss.item():.4f} | l_s: {smoothness_loss.item():.4f} | fx: {ba_proj[0, 0, 0].item():.2f} | fy: {ba_proj[0, 1, 1].item():.2f}"
+                    )
+
+        if nan_detected:
+            break
 
         if not do_global:
             optimized_until = ba_window_end
@@ -1122,6 +1218,10 @@ def ba_refinement(config, initial_trajectory, proj, uncertainties, seq_imgs, seq
         global_ba_step += 1
 
     ba_pbar.close()
+
+    if nan_detected:
+        print("BA refinement failed due to NaN values. Returning initial trajectory.")
+        return torch.tensor(initial_trajectory), proj, {}
 
     ba_poses_c2w = param_to_pose(ba_param_rot, ba_param_t)
 

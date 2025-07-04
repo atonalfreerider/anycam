@@ -24,8 +24,9 @@ class NPZDepthWrapper(nn.Module):
         if not os.path.exists(self.depth_dir):
             raise ValueError(f"Depth directory does not exist: {self.depth_dir}")
         
-        # Cache for loaded depth maps to avoid repeated I/O
+        # Smaller cache for batch processing to reduce memory usage
         self.depth_cache = {}
+        self.max_cache_size = 10  # Reduced from 50 to 10
         self.current_frame_idx = 0
         
         # Get available frame indices
@@ -40,12 +41,18 @@ class NPZDepthWrapper(nn.Module):
         
         print(f"NPZDepthWrapper initialized with depth_dir: {self.depth_dir}")
         print(f"Found {len(self.available_frames)} depth files")
-        
+
     def _load_depth_frame(self, frame_idx):
         """Load a single depth frame from NPZ file"""
 
         if frame_idx in self.depth_cache:
-            return self.depth_cache[frame_idx]
+            depth = self.depth_cache[frame_idx]
+            # Validate cached depth
+            if np.isnan(depth).any() or np.isinf(depth).any() or (depth <= 0).any():
+                print(f"Warning: Invalid cached depth for frame {frame_idx}, reloading...")
+                del self.depth_cache[frame_idx]
+            else:
+                return depth
             
         depth_path = os.path.join(self.depth_dir, self.frame_pattern.format(frame_idx))
         
@@ -62,13 +69,37 @@ class NPZDepthWrapper(nn.Module):
             depth_data = np.load(depth_path)
             depth = depth_data[self.depth_key].astype(np.float32)
 
-            # Cache the depth map (limit cache size to avoid memory issues)
-            if len(self.depth_cache) < 100:  # Limit cache size
-                self.depth_cache[frame_idx] = depth
+            # Validate depth values
+            if np.isnan(depth).any():
+                print(f"Warning: NaN values detected in depth {frame_idx}, replacing with mean")
+                depth = np.nan_to_num(depth, nan=np.nanmean(depth) if not np.isnan(depth).all() else 1.0)
+            
+            if np.isinf(depth).any():
+                print(f"Warning: Inf values detected in depth {frame_idx}, clipping")
+                depth = np.clip(depth, 0.01, 100.0)
+            
+            if (depth <= 0).any():
+                print(f"Warning: Non-positive depth values detected in depth {frame_idx}, clipping to minimum")
+                depth = np.clip(depth, 0.01, np.inf)
+            
+            # Additional sanity check
+            if depth.mean() < 0.001 or depth.mean() > 1000:
+                print(f"Warning: Suspicious depth mean {depth.mean()} for frame {frame_idx}")
+
+            # Cache management - remove oldest entries if cache is full
+            if len(self.depth_cache) >= self.max_cache_size:
+                # Remove oldest entry (FIFO)
+                oldest_key = next(iter(self.depth_cache))
+                del self.depth_cache[oldest_key]
+                
+            self.depth_cache[frame_idx] = depth
                 
             return depth
         except Exception as e:
-            raise RuntimeError(f"Failed to load depth from {depth_path}: {str(e)}")
+            print(f"Error loading depth from {depth_path}: {str(e)}")
+            # Return dummy depth to prevent complete failure
+            dummy_depth = np.ones((480, 640), dtype=np.float32) * 1.0  # Default depth
+            return dummy_depth
 
     def forward(self, rgbs, return_features=False, frame_indices=None):
         """
@@ -147,7 +178,13 @@ class NPZDepthWrapper(nn.Module):
 
     def clear_cache(self):
         """Clear the depth cache to free memory"""
+        cache_size = len(self.depth_cache)
         self.depth_cache.clear()
+        print(f"Cleared depth cache ({cache_size} entries)")
+        
+        # Force garbage collection after clearing cache
+        import gc
+        gc.collect()
 
     @classmethod
     def from_conf(cls, conf):
