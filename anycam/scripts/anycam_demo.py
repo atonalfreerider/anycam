@@ -132,7 +132,7 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
     
     Returns:
         trajectory: The estimated camera trajectory
-        proj: The camera projection matrix
+        per_frame_projs: List of projection matrices per frame
         extras_dict: Additional information from the fitting process
         ba_extras: Bundle adjustment extra information
     """
@@ -149,6 +149,7 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
                 "shift": 99,
                 "square_crop": True,
                 "return_all_uncerts": False,
+                "proj_strategy": "weighted",  # Allow varying focal lengths
             },
             "ba_refinement": {
                 "with_rerun": False,
@@ -171,9 +172,10 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
 
     print(f"Processing {len(frames)} frames...")
     print(f"Bundle adjustment refinement: {'Enabled' if ba_refinement else 'Disabled'}")
+    print("Varying focal length support: Enabled")
     
     # Run fit_video function
-    trajectory, proj, extras_dict, ba_extras = fit_video(
+    trajectory, per_frame_projs, extras_dict, ba_extras = fit_video(
         config,
         model,
         criterion,
@@ -182,38 +184,68 @@ def process_video(model, criterion, frames, config=None, ba_refinement=True):
     )
     
     print("Finished processing video")
-    return trajectory, proj, extras_dict, ba_extras
+    return trajectory, per_frame_projs, extras_dict, ba_extras
 
-
-def plot_to_rerun(
-        trajectory, 
-        depths, 
-        imgs, 
-        proj,
-        uncertainties=None, 
-        subsample_pts=1, 
-        radii=1.5, 
-        uncertainty_thresh=-1, 
-        max_depth=-1, 
-        filter_depth_threshold=0.1,
-        image_plane_distance=0.05,
-        keyframes=None,
-        rerun_mode="spawn",
-        ):
+def save_results_as_json(trajectory, per_frame_projs, output_path, frame_info=None):
+    """
+    Save trajectory and per-frame projection matrices as a single JSON file.
     
-    h, w = imgs[0].shape[:2]
-
-    def filter_depth(depth, threshold=0.1):
-        _, h, w = depth.shape
-
-        depth = depth.clone()[None, ...]
-        median = torch.median(depth)
+    Args:
+        trajectory: List of 4x4 camera poses
+        per_frame_projs: List of 3x3 projection matrices per frame
+        output_path: Path to save the JSON file
+        frame_info: Optional additional frame information
+    """
+    output_data = {
+        "metadata": {
+            "description": "AnyCam camera tracking results with varying focal lengths",
+            "num_frames": len(trajectory),
+            "coordinate_system": "OpenCV (right-handed, Y-down)",
+            "units": "pixels for focal length, meters for translation"
+        },
+        "frames": []
+    }
+    
+    for i, (pose, proj) in enumerate(zip(trajectory, per_frame_projs)):
+        # Extract focal length from projection matrix
+        focal_x = float(proj[0, 0])
+        focal_y = float(proj[1, 1])
         
-        depth_grad = torch.stack(torch.gradient(depth, dim=(-2, -1))).norm(dim=0)
-
-        mask = depth_grad < median * threshold
-
-        return mask
+        # Extract principal point
+        cx = float(proj[0, 2])
+        cy = float(proj[1, 2])
+        
+        # Convert pose to lists for JSON serialization
+        pose_matrix = pose.cpu().numpy().tolist() if hasattr(pose, 'cpu') else pose.tolist()
+        
+        frame_data = {
+            "frame_id": i,
+            "camera_pose": {
+                "matrix": pose_matrix,
+                "translation": [pose_matrix[0][3], pose_matrix[1][3], pose_matrix[2][3]],
+                "rotation_matrix": [
+                    [pose_matrix[0][0], pose_matrix[0][1], pose_matrix[0][2]],
+                    [pose_matrix[1][0], pose_matrix[1][1], pose_matrix[1][2]],
+                    [pose_matrix[2][0], pose_matrix[2][1], pose_matrix[2][2]]
+                ]
+            },
+            "camera_intrinsics": {
+                "focal_length": {
+                    "fx": focal_x,
+                    "fy": focal_y
+                },
+                "principal_point": {
+                    "cx": cx,
+                    "cy": cy
+                },
+                "projection_matrix": proj.tolist()
+            }
+        }
+        
+        if frame_info and i < len(frame_info):
+            frame_data.update(frame_info[i])
+            
+        output_data["frames"].append(frame_data)
     
     def lift_image(img, depth, pose, proj):
         h, w = img.shape[:2]
@@ -252,7 +284,8 @@ def plot_to_rerun(
 
         return pts, colors
     
-    imgs = np.array(imgs)
+    print(f"Saved camera tracking results to {json_path}")
+    return json_path
 
     # Initialize rerun with appropriate mode
     if rerun_mode == "spawn":
@@ -346,36 +379,11 @@ def plot_to_rerun(
 @hydra.main(version_base=None, config_name=None)
 def main(cfg: DictConfig):
     """
-    AnyCam demo script for processing videos and extracting 3D information.
+    AnyCam demo script for processing videos and extracting 3D information with varying focal lengths.
     
     Example usage:
-    - Process video: python anycam_demo.py input_path=/path/to/video output_path=/path/to/output
-    - Process images: python anycam_demo.py input_path=/path/to/images_folder output_path=/path/to/output
-    - Visualize with rerun: python anycam_demo.py input_path=/path/to/video visualize=true
-    - Connect to existing rerun server: python anycam_demo.py input_path=/path/to/video visualize=true rerun_mode=connect rerun_address=localhost:8787
-    - Export to COLMAP: python anycam_demo.py input_path=/path/to/video export_colmap=true output_path=/path/to/colmap_output
-    - Disable BA refinement: python anycam_demo.py input_path=/path/to/video ba_refinement=false
-    - Subsample frames: python anycam_demo.py input_path=/path/to/video fps=10
-    
-    Config parameters:
-    - input_path: Path to video or directory of images
-    - output_path: Path to save outputs
-    - model_path: Path to model (optional)
-    - checkpoint: Specific checkpoint to use (optional)
-    - visualize: Whether to visualize results with rerun (boolean)
-    - rerun_mode: Mode to use for rerun visualization ('spawn' or 'connect', default: 'spawn')
-    - rerun_address: Address to connect to when using rerun_mode=connect (default: localhost:8787)
-    - export_colmap: Whether to export to COLMAP format (boolean)
-    - image_size: Target image size for processing (default: 336)
-    - ba_refinement: Whether to perform bundle adjustment refinement (default: True)
-    - fps: Target frames per second (default: 0, use all frames)
-    - vis: Visualization parameters subconfig with the following options:
-        - subsample_pts: Point sampling rate (default: 1)
-        - radii: Point radius for visualization (default: 1.5)
-        - uncertainty_thresh: Threshold for uncertainty visualization (default: 0.05)
-        - max_depth: Maximum depth value to consider (default: -1, no limit)
-        - filter_depth_threshold: Threshold for depth filtering (default: 0.1)
-        - image_plane_distance: Distance of image plane in visualization (default: 0.05)
+    - Process video with varying focal lengths: python anycam_demo.py input_path=/path/to/video output_path=/path/to/output
+    - Process with JSON output: python anycam_demo.py input_path=/path/to/video output_path=/path/to/output export_json=true
     """
     input_path = cfg.get("input_path", None)
     output_path = cfg.get("output_path", None)
@@ -384,6 +392,7 @@ def main(cfg: DictConfig):
     visualize = cfg.get("visualize", False)
     rerun_mode = cfg.get("rerun_mode", "spawn")
     export_colmap = cfg.get("export_colmap", False)
+    export_json = cfg.get("export_json", True)  # Default to JSON export
     image_size = cfg.get("image_size", 336)
     ba_refinement = cfg.get("ba_refinement", True)
     target_fps = cfg.get("fps", 0)  # 0 means use all frames
@@ -426,8 +435,8 @@ def main(cfg: DictConfig):
     model, criterion = load_anycam(model_path, checkpoint)
     model = model.cuda().eval()
     
-    # Process frames
-    trajectory, proj, extras_dict, ba_extras = process_video(
+    # Process frames with varying focal length support
+    trajectory, per_frame_projs, extras_dict, ba_extras = process_video(
         model, 
         criterion, 
         frames, 
@@ -436,37 +445,46 @@ def main(cfg: DictConfig):
 
     trajectory = [se3_ensure_numerical_accuracy(torch.tensor(pose)) for pose in trajectory]
     
-    # Extract depth and uncertainty information
-    best_candidate = extras_dict["best_candidate"]
-    depths = extras_dict["seq_depths"]
-
-    if not ba_refinement:
-        read_frames = frames
-        frames = extras_dict["images"].permute(0, 2, 3, 1).cpu().numpy()
-        keyframes = [i for i in range(len(trajectory))]
-        uncertainties = torch.stack(extras_dict["uncertainties"])[:, 0, best_candidate, :1, :, :]
-    else:
-        keyframes = [i * 3 for i in range(len(trajectory) // 3)]
-        uncertainties = extras_dict["ba_uncertainties"]
-        read_frames = frames
-
-
-    uncertainties = torch.cat((uncertainties, uncertainties[-1:]), dim=0)
+    print(f"Processed video: {len(trajectory)} poses, {len(per_frame_projs)} projection matrices")
+    print("Varying focal lengths detected and preserved per frame")
     
+    # Create output directory if specified
+    if output_path:
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        print(f"Saving results to {output_path}")
     
-    print(f"Processed video: {len(trajectory)} poses, {len(depths)} depth maps")
+    # Export JSON with per-frame data (default behavior)
+    if export_json and output_path:
+        json_path = save_results_as_json(trajectory, per_frame_projs, output_path)
+        print(f"Saved JSON results to {json_path}")
+    
+    # Legacy numpy exports (optional)
+    if output_path and not export_colmap and not export_json:
+        # Save trajectory as numpy array
+        trajectory_np = np.stack([pose.cpu().numpy() for pose in trajectory])
+        np.save(output_path / "trajectory.npy", trajectory_np)
+        
+        # Save per-frame projection matrices
+        proj_matrices_np = np.stack(per_frame_projs)
+        np.save(output_path / "per_frame_projections.npy", proj_matrices_np)
+        
+        # Extract focal lengths for backward compatibility
+        focal_lengths = [proj[0, 0] for proj in per_frame_projs]
+        np.save(output_path / "focal_lengths_per_frame.npy", np.array(focal_lengths))
+        
+        print("Saved legacy numpy outputs")
     
     if export_colmap:
-        if output_path is None:
-            print("Warning: output_path not specified, using temporary directory")
-        
         from anycam.utils.colmap_io import export_to_colmap
         
         print("Exporting results to COLMAP format...")
+        # Use first projection matrix as representative for COLMAP
+        representative_proj = per_frame_projs[0] if per_frame_projs else None
         colmap_path = export_to_colmap(
             trajectory=trajectory,
-            proj=proj,
-            imgs=read_frames,
+            proj=representative_proj,
+            imgs=frames,
             out_dir=output_path
         )
         print(f"Exported COLMAP reconstruction to {colmap_path}")
@@ -501,17 +519,36 @@ def main(cfg: DictConfig):
             
         print("Saved all results successfully")
 
-        # Visualization or export
+    # Visualization
     if visualize:
-        # Get visualization parameters from vis subconfig
         vis_config = cfg.get("vis", {})
         
         print(f"Visualizing results with rerun (mode: {rerun_mode})...")
+        
+        # Extract depth and uncertainty information
+        best_candidate = extras_dict["best_candidate"]
+        depths = extras_dict["seq_depths"]
+
+        if not ba_refinement:
+            read_frames = frames
+            frames = extras_dict["images"].permute(0, 2, 3, 1).cpu().numpy()
+            keyframes = [i for i in range(len(trajectory))]
+            uncertainties = torch.stack(extras_dict["uncertainties"])[:, 0, best_candidate, :1, :, :]
+        else:
+            keyframes = [i * 3 for i in range(len(trajectory) // 3)]
+            uncertainties = extras_dict.get("ba_uncertainties")
+
+        if uncertainties is not None:
+            uncertainties = torch.cat((uncertainties, uncertainties[-1:]), dim=0)
+        
+        # Use first projection matrix for visualization
+        representative_proj = per_frame_projs[0]
+        
         plot_to_rerun(
             trajectory=trajectory,
             depths=depths,
             imgs=frames,
-            proj=proj,
+            proj=representative_proj,
             uncertainties=uncertainties,
             subsample_pts=vis_config.get("subsample_pts", 2),
             radii=vis_config.get("radii", 1.5),

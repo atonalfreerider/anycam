@@ -243,7 +243,6 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
     print(f"proj_strategy: {proj_strategy}")
     print(f"proj_label_source: {proj_label_source}")
 
-
     dataset = make_dataset(dataset_config, imgs, device="cpu")
 
     if config.with_rerun:
@@ -304,6 +303,7 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
     sub_trajectories = []
     
     proj_labels = []
+    frame_focal_lengths = []  # Store focal lengths per frame
 
     uncertainties = []
     angle_sum = 0
@@ -364,6 +364,12 @@ def fit_video(config, model, criterion, imgs, device="cuda", return_extras=False
             angle_sum = angle_sum + mean_angle
 
         proj_labels.append(proj_label[0] * mean_angle)
+
+        # Store focal length candidates for each frame in this sequence
+        for j in range(seq_len_-1):
+            frame_idx = i + j
+            if frame_idx < len(dataset)-1:
+                frame_focal_lengths.append(pose_result["focal_length_candidates"][0])
 
         with torch.autocast(device_type="cuda", dtype=torch.float32):
             sub_trajectory = [torch.eye(4, device=device).view(1, 4, 4).expand(num_candidates, -1, -1)]
